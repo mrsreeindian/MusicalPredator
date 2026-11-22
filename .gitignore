@@ -1,0 +1,34 @@
+# Reference & external research materials
+Acer-P-Helper/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution output (large binaries)
+dist/
+build/
+*.spec
+
+# Local cache & temporary files
+current_album_cover.jpg
+cache/
+*.log
+*.tmp
+*.bak
+
+# Environment & IDE
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

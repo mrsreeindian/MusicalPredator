@@ -1,0 +1,15 @@
+# Predator Keyboard Music Sync - Dependencies
+# Python 3.10+ on Windows 10/11 (64-bit)
+
+# Core Audio Capture & Real-Time FFT Analysis
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# Image Processing & Album Art Palette Extraction
+pillow>=10.0.0
+
+# Windows System Tray Integration
+pystray>=0.19.5
+
+# Standalone Application & Installer Packaging
+pyinstaller>=6.0.0

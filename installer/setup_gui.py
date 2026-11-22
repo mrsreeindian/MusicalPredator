@@ -1,0 +1,750 @@
+"""
+Predator Keyboard Music Sync - Predator iCUE Pro Standalone Setup Wizard
+Professional, zero-UAC user-level Windows Installer.
+Installs to %LOCALAPPDATA%\\Programs\\PredatorSync, creates shortcuts,
+configures autostart, and registers in Windows Add/Remove Programs.
+"""
+
+import os
+import sys
+import shutil
+import subprocess
+import threading
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from typing import Optional
+from PIL import Image, ImageTk, ImageDraw
+
+
+# Theme Palette (Predator iCUE Pure Black Aesthetic)
+COLOR_BG = "#000000"
+COLOR_PANEL = "#0B0B0B"
+COLOR_CARD = "#121212"
+COLOR_BORDER = "#1F1F1F"
+COLOR_ACCENT = "#FFD100"      # Predator Electric Yellow
+COLOR_ACCENT_HOVER = "#FFE033"
+COLOR_TEXT = "#FFFFFF"
+COLOR_MUTED = "#888888"
+COLOR_DARK_TEXT = "#555555"
+FONT_FAMILY = "Segoe UI"
+FONT_MONO = "Consolas"
+
+
+def get_default_install_dir() -> str:
+    """Returns %LOCALAPPDATA%\\Programs\\PredatorSync for zero-UAC installation."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        local_app_data = os.path.expanduser(r"~\AppData\Local")
+    return os.path.join(local_app_data, "Programs", "PredatorSync")
+
+
+def get_payload_paths():
+    """Finds bundled or local PredatorSync.exe and assets."""
+    if getattr(sys, "frozen", False):
+        base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    else:
+        # Running from project source
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    candidates_exe = [
+        os.path.join(base_dir, "payload", "PredatorSync.exe"),
+        os.path.join(base_dir, "dist", "PredatorSync.exe"),
+        os.path.join(base_dir, "PredatorSync.exe"),
+    ]
+    exe_path = None
+    for c in candidates_exe:
+        if os.path.exists(c):
+            exe_path = c
+            break
+
+    candidates_assets = [
+        os.path.join(base_dir, "payload", "assets"),
+        os.path.join(base_dir, "assets"),
+        os.path.join(base_dir, "dist", "assets"),
+    ]
+    assets_path = None
+    for a in candidates_assets:
+        if os.path.isdir(a):
+            assets_path = a
+            break
+
+    return exe_path, assets_path
+
+
+class PredatorSetupWizard:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Predator Keyboard Music Sync // Setup Wizard")
+        self.root.configure(bg=COLOR_BG)
+        self.root.resizable(False, False)
+
+        # Window geometry
+        win_w, win_h = 640, 480
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        pos_x = max(0, (screen_w - win_w) // 2)
+        pos_y = max(0, (screen_h - win_h) // 2)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+
+        # Installation options state
+        self.var_install_dir = tk.StringVar(value=get_default_install_dir())
+        self.var_shortcut_desktop = tk.BooleanVar(value=True)
+        self.var_shortcut_start = tk.BooleanVar(value=True)
+        self.var_autostart = tk.BooleanVar(value=True)
+        self.var_launch_now = tk.BooleanVar(value=True)
+
+        # Set Window Icon
+        self._load_icon()
+
+        # Build UI Container
+        self.main_container = tk.Frame(self.root, bg=COLOR_BG)
+        self.main_container.pack(fill="both", expand=True)
+
+        self.current_screen = 0
+        self.screens = []
+
+        # Header Bar
+        self._build_header()
+
+        # Content Area
+        self.content_frame = tk.Frame(self.main_container, bg=COLOR_BG)
+        self.content_frame.pack(fill="both", expand=True, padx=24, pady=16)
+
+        # Bottom Navigation Bar
+        self._build_footer()
+
+        # Show Screen 1
+        self.show_screen(1)
+
+    def _load_icon(self):
+        """Loads and sets the window icon."""
+        _, assets_dir = get_payload_paths()
+        if assets_dir:
+            ico = os.path.join(assets_dir, "predator_icon.ico")
+            if os.path.exists(ico):
+                try:
+                    self.root.iconbitmap(ico)
+                except Exception:
+                    pass
+
+    def _build_header(self):
+        """Sleek pure black Predator header with brand text and status indicator."""
+        header = tk.Frame(self.main_container, bg=COLOR_PANEL, height=56, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+
+        # Predator electric yellow accent bar on left
+        accent_strip = tk.Frame(header, bg=COLOR_ACCENT, width=4)
+        accent_strip.pack(side="left", fill="y")
+
+        info_box = tk.Frame(header, bg=COLOR_PANEL)
+        info_box.pack(side="left", padx=16, fill="y")
+
+        lbl_title = tk.Label(
+            info_box,
+            text="PREDATOR SYNC // INSTALLER",
+            font=(FONT_FAMILY, 11, "bold"),
+            fg=COLOR_TEXT,
+            bg=COLOR_PANEL
+        )
+        lbl_title.pack(anchor="w", pady=(8, 0))
+
+        lbl_sub = tk.Label(
+            info_box,
+            text="Acer Predator Helios Neo 16",
+            font=(FONT_FAMILY, 8),
+            fg=COLOR_ACCENT,
+            bg=COLOR_PANEL
+        )
+        lbl_sub.pack(anchor="w")
+
+        # Version Badge on Right
+        lbl_ver = tk.Label(
+            header,
+            text="v1.0.0",
+            font=(FONT_MONO, 8, "bold"),
+            fg=COLOR_BG,
+            bg=COLOR_ACCENT,
+            padx=8,
+            pady=2
+        )
+        lbl_ver.pack(side="right", padx=18)
+
+    def _build_footer(self):
+        """Bottom navigation footer with aligned Predator buttons."""
+        footer = tk.Frame(self.main_container, bg=COLOR_PANEL, height=52, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        footer.pack(fill="x", side="bottom")
+        footer.pack_propagate(False)
+
+        btn_box = tk.Frame(footer, bg=COLOR_PANEL)
+        btn_box.pack(side="right", padx=18, pady=10)
+
+        self.btn_back = tk.Button(
+            btn_box,
+            text="< BACK",
+            font=(FONT_FAMILY, 9, "bold"),
+            fg=COLOR_TEXT,
+            bg=COLOR_CARD,
+            activeforeground=COLOR_ACCENT,
+            activebackground=COLOR_BORDER,
+            bd=0,
+            padx=16,
+            pady=4,
+            cursor="hand2",
+            command=self.on_back
+        )
+        self.btn_back.pack(side="left", padx=6)
+
+        self.btn_next = tk.Button(
+            btn_box,
+            text="NEXT >",
+            font=(FONT_FAMILY, 9, "bold"),
+            fg=COLOR_BG,
+            bg=COLOR_ACCENT,
+            activeforeground=COLOR_BG,
+            activebackground=COLOR_ACCENT_HOVER,
+            bd=0,
+            padx=20,
+            pady=4,
+            cursor="hand2",
+            command=self.on_next
+        )
+        self.btn_next.pack(side="left", padx=6)
+
+        self.btn_cancel = tk.Button(
+            footer,
+            text="CANCEL",
+            font=(FONT_FAMILY, 8),
+            fg=COLOR_MUTED,
+            bg=COLOR_PANEL,
+            activeforeground=COLOR_TEXT,
+            activebackground=COLOR_PANEL,
+            bd=0,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=self.root.destroy
+        )
+        self.btn_cancel.pack(side="left", padx=18, pady=10)
+
+    def _clear_content(self):
+        for w in self.content_frame.winfo_children():
+            w.destroy()
+
+    def show_screen(self, screen_id: int):
+        self.current_screen = screen_id
+        self._clear_content()
+
+        if screen_id == 1:
+            self._render_screen_welcome()
+        elif screen_id == 2:
+            self._render_screen_options()
+        elif screen_id == 3:
+            self._render_screen_installing()
+        elif screen_id == 4:
+            self._render_screen_finish()
+
+    # --------------------------------------------------------------------------
+    # SCREEN 1: Welcome & Overview
+    # --------------------------------------------------------------------------
+    def _render_screen_welcome(self):
+        self.btn_back.config(state="disabled")
+        self.btn_next.config(text="NEXT >", state="normal")
+
+        card = tk.Frame(self.content_frame, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        card.pack(fill="both", expand=True, padx=6, pady=6)
+
+        inner = tk.Frame(card, bg=COLOR_CARD)
+        inner.pack(fill="both", expand=True, padx=24, pady=20)
+
+        # Title
+        tk.Label(
+            inner,
+            text="Welcome to Predator Sync Setup",
+            font=(FONT_FAMILY, 15, "bold"),
+            fg=COLOR_TEXT,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(0, 6))
+
+        tk.Label(
+            inner,
+            text="This wizard will install Predator Keyboard Music Sync on your system.",
+            font=(FONT_FAMILY, 9),
+            fg=COLOR_MUTED,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(0, 16))
+
+        # Features Card
+        feat_box = tk.Frame(inner, bg=COLOR_PANEL, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        feat_box.pack(fill="x", pady=6)
+
+        features = [
+            ("⚡ 60 FPS Real-Time Music Sync", "Ultra-low latency FFT audio analysis & 4-zone beat detection"),
+            ("⌨ Hardware ACPI EC Driver", "Direct physical keyboard RGB control (Zero-Elevation, No Admin needed)"),
+            ("🎨 Audio-Reactive Lighting", "12 animations, studio EQ bars, and album art color sync"),
+            ("🔔 Background System Tray Suite", "Persistent notification area service with quick mode switcher"),
+            ("🚀 Start on Boot Ready", "Silent background startup directly into Windows System Tray")
+        ]
+
+        for title, desc in features:
+            f_row = tk.Frame(feat_box, bg=COLOR_PANEL)
+            f_row.pack(fill="x", padx=12, pady=5)
+
+            tk.Label(
+                f_row,
+                text=title,
+                font=(FONT_FAMILY, 8, "bold"),
+                fg=COLOR_ACCENT,
+                bg=COLOR_PANEL,
+                width=26,
+                anchor="w"
+            ).pack(side="left")
+
+            tk.Label(
+                f_row,
+                text=desc,
+                font=(FONT_FAMILY, 8),
+                fg=COLOR_TEXT,
+                bg=COLOR_PANEL,
+                anchor="w"
+            ).pack(side="left", fill="x")
+
+        tk.Label(
+            inner,
+            text="Click Next to customize installation directory and shortcuts.",
+            font=(FONT_FAMILY, 8),
+            fg=COLOR_DARK_TEXT,
+            bg=COLOR_CARD
+        ).pack(side="bottom", anchor="w", pady=(10, 0))
+
+    # --------------------------------------------------------------------------
+    # SCREEN 2: Installation Options
+    # --------------------------------------------------------------------------
+    def _render_screen_options(self):
+        self.btn_back.config(state="normal")
+        self.btn_next.config(text="INSTALL", state="normal")
+
+        card = tk.Frame(self.content_frame, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        card.pack(fill="both", expand=True, padx=6, pady=6)
+
+        inner = tk.Frame(card, bg=COLOR_CARD)
+        inner.pack(fill="both", expand=True, padx=24, pady=16)
+
+        # 1. Directory Section
+        tk.Label(
+            inner,
+            text="Destination Folder",
+            font=(FONT_FAMILY, 11, "bold"),
+            fg=COLOR_TEXT,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(0, 4))
+
+        tk.Label(
+            inner,
+            text="Predator Sync will be installed to user folder without requiring UAC elevation:",
+            font=(FONT_FAMILY, 8),
+            fg=COLOR_MUTED,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(0, 8))
+
+        dir_box = tk.Frame(inner, bg=COLOR_CARD)
+        dir_box.pack(fill="x", pady=(0, 16))
+
+        entry_dir = tk.Entry(
+            dir_box,
+            textvariable=self.var_install_dir,
+            font=(FONT_MONO, 8),
+            fg=COLOR_TEXT,
+            bg=COLOR_PANEL,
+            insertbackground=COLOR_ACCENT,
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+            highlightcolor=COLOR_ACCENT
+        )
+        entry_dir.pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 8))
+
+        btn_browse = tk.Button(
+            dir_box,
+            text="BROWSE...",
+            font=(FONT_FAMILY, 8, "bold"),
+            fg=COLOR_TEXT,
+            bg=COLOR_PANEL,
+            activeforeground=COLOR_ACCENT,
+            activebackground=COLOR_BORDER,
+            bd=0,
+            padx=10,
+            cursor="hand2",
+            command=self._browse_directory
+        )
+        btn_browse.pack(side="right")
+
+        # 2. Options / Checkboxes Section
+        tk.Label(
+            inner,
+            text="Shortcuts & Startup Options",
+            font=(FONT_FAMILY, 11, "bold"),
+            fg=COLOR_TEXT,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(4, 4))
+
+        opt_frame = tk.Frame(inner, bg=COLOR_PANEL, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        opt_frame.pack(fill="x", pady=6)
+
+        cb1 = tk.Checkbutton(
+            opt_frame,
+            text="Create Desktop Shortcut",
+            variable=self.var_shortcut_desktop,
+            font=(FONT_FAMILY, 9),
+            fg=COLOR_TEXT,
+            bg=COLOR_PANEL,
+            activebackground=COLOR_PANEL,
+            activeforeground=COLOR_ACCENT,
+            selectcolor=COLOR_BORDER,
+            anchor="w"
+        )
+        cb1.pack(fill="x", padx=12, pady=4)
+
+        cb2 = tk.Checkbutton(
+            opt_frame,
+            text="Create Start Menu Shortcut",
+            variable=self.var_shortcut_start,
+            font=(FONT_FAMILY, 9),
+            fg=COLOR_TEXT,
+            bg=COLOR_PANEL,
+            activebackground=COLOR_PANEL,
+            activeforeground=COLOR_ACCENT,
+            selectcolor=COLOR_BORDER,
+            anchor="w"
+        )
+        cb2.pack(fill="x", padx=12, pady=4)
+
+        cb3 = tk.Checkbutton(
+            opt_frame,
+            text="Start Predator Sync with Windows on Boot (Silently to Tray)",
+            variable=self.var_autostart,
+            font=(FONT_FAMILY, 9),
+            fg=COLOR_TEXT,
+            bg=COLOR_PANEL,
+            activebackground=COLOR_PANEL,
+            activeforeground=COLOR_ACCENT,
+            selectcolor=COLOR_BORDER,
+            anchor="w"
+        )
+        cb3.pack(fill="x", padx=12, pady=4)
+
+    def _browse_directory(self):
+        new_dir = filedialog.askdirectory(initialdir=self.var_install_dir.get(), title="Select Destination Folder")
+        if new_dir:
+            self.var_install_dir.set(os.path.normpath(new_dir))
+
+    # --------------------------------------------------------------------------
+    # SCREEN 3: Extraction & Progress
+    # --------------------------------------------------------------------------
+    def _render_screen_installing(self):
+        self.btn_back.config(state="disabled")
+        self.btn_next.config(state="disabled")
+        self.btn_cancel.config(state="disabled")
+
+        card = tk.Frame(self.content_frame, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        card.pack(fill="both", expand=True, padx=6, pady=6)
+
+        inner = tk.Frame(card, bg=COLOR_CARD)
+        inner.pack(fill="both", expand=True, padx=24, pady=24)
+
+        tk.Label(
+            inner,
+            text="Installing Predator Sync...",
+            font=(FONT_FAMILY, 13, "bold"),
+            fg=COLOR_TEXT,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(0, 6))
+
+        self.lbl_progress_status = tk.Label(
+            inner,
+            text="Preparing installation...",
+            font=(FONT_FAMILY, 8),
+            fg=COLOR_MUTED,
+            bg=COLOR_CARD
+        )
+        self.lbl_progress_status.pack(anchor="w", pady=(0, 16))
+
+        # Modern Custom Progress Bar
+        bar_bg = tk.Frame(inner, bg=COLOR_PANEL, height=18, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        bar_bg.pack(fill="x", pady=8)
+        bar_bg.pack_propagate(False)
+
+        self.progress_fill = tk.Frame(bar_bg, bg=COLOR_ACCENT, width=0)
+        self.progress_fill.pack(side="left", fill="y")
+
+        self.lbl_progress_pct = tk.Label(
+            inner,
+            text="0%",
+            font=(FONT_MONO, 8, "bold"),
+            fg=COLOR_ACCENT,
+            bg=COLOR_CARD
+        )
+        self.lbl_progress_pct.pack(anchor="e", pady=(4, 0))
+
+        # Launch background installer thread
+        threading.Thread(target=self._run_installation, daemon=True).start()
+
+    def _set_progress(self, pct: float, status: str):
+        def _update():
+            pct_int = int(min(100, max(0, pct)))
+            self.lbl_progress_status.config(text=status)
+            self.lbl_progress_pct.config(text=f"{pct_int}%")
+            self.root.update_idletasks()
+            total_w = self.content_frame.winfo_width() - 60
+            self.progress_fill.config(width=int(total_w * (pct_int / 100.0)))
+        self.root.after(0, _update)
+
+    def _run_installation(self):
+        try:
+            target_dir = os.path.normpath(self.var_install_dir.get())
+            self._set_progress(10, f"Creating destination directory: {target_dir}")
+            os.makedirs(target_dir, exist_ok=True)
+            time.sleep(0.2)
+
+            # 1. Terminate any running instances
+            self._set_progress(20, "Checking running processes...")
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", "PredatorSync.exe"], capture_output=True)
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+            # 2. Extract payload
+            exe_src, assets_src = get_payload_paths()
+            if not exe_src or not os.path.exists(exe_src):
+                raise RuntimeError("PredatorSync.exe payload not found in installer package.")
+
+            self._set_progress(40, "Copying PredatorSync.exe binary...")
+            target_exe = os.path.join(target_dir, "PredatorSync.exe")
+            shutil.copy2(exe_src, target_exe)
+            time.sleep(0.2)
+
+            if assets_src and os.path.isdir(assets_src):
+                self._set_progress(55, "Copying application assets and icons...")
+                target_assets = os.path.join(target_dir, "assets")
+                if os.path.exists(target_assets):
+                    shutil.rmtree(target_assets)
+                shutil.copytree(assets_src, target_assets)
+            time.sleep(0.2)
+
+            # 3. Create Shortcuts
+            target_ico = os.path.join(target_dir, "assets", "predator_icon.ico")
+            icon_loc = f"{target_ico}, 0" if os.path.exists(target_ico) else ""
+
+            if self.var_shortcut_desktop.get():
+                self._set_progress(70, "Creating Desktop shortcut...")
+                self._create_shortcut(
+                    shortcut_name="Predator Keyboard Sync.lnk",
+                    folder=os.path.expanduser(r"~\Desktop"),
+                    target=target_exe,
+                    work_dir=target_dir,
+                    icon=icon_loc,
+                    desc="Acer Predator Helios Neo 16 4-Zone RGB Music Sync"
+                )
+
+            if self.var_shortcut_start.get():
+                self._set_progress(80, "Creating Start Menu shortcuts...")
+                start_dir = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Predator Sync")
+                os.makedirs(start_dir, exist_ok=True)
+                self._create_shortcut(
+                    shortcut_name="Predator Keyboard Sync.lnk",
+                    folder=start_dir,
+                    target=target_exe,
+                    work_dir=target_dir,
+                    icon=icon_loc,
+                    desc="Acer Predator Helios Neo 16 4-Zone RGB Music Sync"
+                )
+
+            # 4. Create Uninstaller
+            self._set_progress(85, "Creating uninstaller...")
+            self._create_uninstaller(target_dir)
+
+            # 5. Register in Windows Add/Remove Programs
+            self._set_progress(90, "Registering in Windows Installed Apps...")
+            self._register_uninstall_entry(target_dir, target_exe, target_ico)
+
+            # 6. Autostart on boot
+            if self.var_autostart.get():
+                self._set_progress(95, "Configuring Start on Windows Boot...")
+                self._configure_autostart(target_exe)
+
+            self._set_progress(100, "Installation completed successfully!")
+            time.sleep(0.4)
+            self.root.after(0, lambda: self.show_screen(4))
+
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Installation Error", f"Installation failed:\n{e}"))
+            self.root.after(0, lambda: self.show_screen(2))
+
+    def _create_shortcut(self, shortcut_name: str, folder: str, target: str, work_dir: str, icon: str = "", desc: str = ""):
+        """Creates a Windows .lnk shortcut using temporary VBScript execution."""
+        os.makedirs(folder, exist_ok=True)
+        lnk_path = os.path.join(folder, shortcut_name)
+        vbs_script = f"""
+Set WshShell = CreateObject("WScript.Shell")
+Set oShortcut = WshShell.CreateShortcut("{lnk_path.replace('\\', '\\\\')}")
+oShortcut.TargetPath = "{target.replace('\\', '\\\\')}"
+oShortcut.WorkingDirectory = "{work_dir.replace('\\', '\\\\')}"
+oShortcut.Description = "{desc}"
+"""
+        if icon:
+            vbs_script += f'oShortcut.IconLocation = "{icon.replace("\\", "\\\\")}"\n'
+        vbs_script += "oShortcut.Save\n"
+
+        subprocess.run(["cscript", "//nologo", "/E:VBScript"], input=vbs_script, text=True, capture_output=True)
+
+    def _create_uninstaller(self, install_dir: str):
+        """Creates clean uninstallation scripts."""
+        uninst_bat_path = os.path.join(install_dir, "uninstall.bat")
+        bat_content = f"""@echo off
+title Predator Sync Uninstaller
+echo ======================================================================
+echo Uninstalling Predator Keyboard Music Sync...
+echo ======================================================================
+
+:: Kill running instances
+taskkill /F /IM PredatorSync.exe >nul 2>&1
+
+:: Remove Autostart Key
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "PredatorMusicSync" /f >nul 2>&1
+
+:: Remove Uninstall Registration Key
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PredatorSync" /f >nul 2>&1
+
+:: Remove Shortcuts
+del /Q "%USERPROFILE%\\Desktop\\Predator Keyboard Sync.lnk" >nul 2>&1
+rd /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Predator Sync" >nul 2>&1
+
+:: Delete installation files (self-deleting batch)
+start /b "" cmd /c timeout /t 1 /nobreak ^>nul ^& rd /S /Q "{install_dir}"
+echo.
+echo Uninstallation Complete.
+if "%1"=="" pause
+exit
+"""
+        with open(uninst_bat_path, "w", encoding="utf-8") as f:
+            f.write(bat_content)
+
+    def _register_uninstall_entry(self, install_dir: str, exe_path: str, ico_path: str):
+        """Registers the application in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PredatorSync."""
+        try:
+            import winreg
+            uninstall_key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PredatorSync"
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, uninstall_key, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "Predator Keyboard Music Sync")
+                winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, "1.0.0")
+                winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "Acer Predator Community")
+                winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, install_dir)
+                if os.path.exists(ico_path):
+                    winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, ico_path)
+                winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, f'cmd.exe /c "{os.path.join(install_dir, "uninstall.bat")}"')
+                winreg.SetValueEx(key, "QuietUninstallString", 0, winreg.REG_SZ, f'cmd.exe /c "{os.path.join(install_dir, "uninstall.bat")} /quiet"')
+                winreg.SetValueEx(key, "EstimatedSize", 0, winreg.REG_DWORD, 36000)
+                winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
+        except Exception as e:
+            print(f"Warning: Failed to write uninstall registry: {e}")
+
+    def _configure_autostart(self, exe_path: str):
+        """Registers start on boot in HKCU Run."""
+        try:
+            import winreg
+            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            cmd = f'"{exe_path}" --minimized'
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "PredatorMusicSync", 0, winreg.REG_SZ, cmd)
+        except Exception as e:
+            print(f"Warning: Failed to set autostart: {e}")
+
+    # --------------------------------------------------------------------------
+    # SCREEN 4: Finish
+    # --------------------------------------------------------------------------
+    def _render_screen_finish(self):
+        self.btn_back.config(state="disabled")
+        self.btn_next.config(text="FINISH", state="normal")
+        self.btn_cancel.config(state="disabled")
+
+        card = tk.Frame(self.content_frame, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        card.pack(fill="both", expand=True, padx=6, pady=6)
+
+        inner = tk.Frame(card, bg=COLOR_CARD)
+        inner.pack(fill="both", expand=True, padx=24, pady=24)
+
+        # Success Emblem / Check
+        tk.Label(
+            inner,
+            text="✔ INSTALLATION COMPLETE",
+            font=(FONT_FAMILY, 14, "bold"),
+            fg=COLOR_ACCENT,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(0, 6))
+
+        tk.Label(
+            inner,
+            text="Predator Keyboard Music Sync has been installed successfully.",
+            font=(FONT_FAMILY, 9),
+            fg=COLOR_TEXT,
+            bg=COLOR_CARD
+        ).pack(anchor="w", pady=(0, 20))
+
+        summary_box = tk.Frame(inner, bg=COLOR_PANEL, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        summary_box.pack(fill="x", pady=6)
+
+        rows = [
+            ("Installed to:", self.var_install_dir.get()),
+            ("System Tray:", "Persistent 60 FPS background sync"),
+            ("Start on Boot:", "Enabled (Silent startup to tray)" if self.var_autostart.get() else "Disabled"),
+            ("Hardware Target:", "Acer Predator Helios Neo 16 (PHN16-71)")
+        ]
+        for label, val in rows:
+            r = tk.Frame(summary_box, bg=COLOR_PANEL)
+            r.pack(fill="x", padx=12, pady=4)
+            tk.Label(r, text=label, font=(FONT_FAMILY, 8, "bold"), fg=COLOR_MUTED, bg=COLOR_PANEL, width=16, anchor="w").pack(side="left")
+            tk.Label(r, text=val, font=(FONT_MONO, 8), fg=COLOR_TEXT, bg=COLOR_PANEL, anchor="w").pack(side="left", fill="x")
+
+        # Launch checkbox
+        cb_launch = tk.Checkbutton(
+            inner,
+            text="Launch Predator Sync now",
+            variable=self.var_launch_now,
+            font=(FONT_FAMILY, 10, "bold"),
+            fg=COLOR_ACCENT,
+            bg=COLOR_CARD,
+            activebackground=COLOR_CARD,
+            activeforeground=COLOR_ACCENT_HOVER,
+            selectcolor=COLOR_PANEL
+        )
+        cb_launch.pack(anchor="w", pady=(20, 0))
+
+    def on_back(self):
+        if self.current_screen > 1:
+            self.show_screen(self.current_screen - 1)
+
+    def on_next(self):
+        if self.current_screen == 1:
+            self.show_screen(2)
+        elif self.current_screen == 2:
+            self.show_screen(3)
+        elif self.current_screen == 4:
+            # Finish action
+            if self.var_launch_now.get():
+                target_exe = os.path.join(self.var_install_dir.get(), "PredatorSync.exe")
+                if os.path.exists(target_exe):
+                    subprocess.Popen([target_exe], cwd=self.var_install_dir.get())
+            self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = PredatorSetupWizard(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
