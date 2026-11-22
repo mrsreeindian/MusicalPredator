@@ -257,6 +257,10 @@ def _init_windows_dpi():
                     pass
 
 
+# Modern Alias
+MusicalPredatorApp = PredatorMusicSyncApp
+
+
 def main():
     _init_windows_dpi()
     prefer_virtual = "--virtual" in sys.argv or "-v" in sys.argv

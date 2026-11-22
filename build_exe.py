@@ -1,8 +1,8 @@
 """
-Build Script for Predator Keyboard Music Sync Standalone Application & Installer
-1. Compiles standalone application: 'dist/PredatorSync.exe'
-2. Compiles standalone Windows Installer: 'dist/PredatorSync-Setup.exe'
-3. Creates distribution package folder and 'dist/PredatorSync-v1.0.0-Windows-x64.zip'
+Build Script for MusicalPredator Standalone Application & Installer
+1. Compiles standalone application: 'dist/MusicalPredator.exe'
+2. Compiles standalone Windows Installer: 'dist/MusicalPredator-Setup.exe'
+3. Creates distribution package folder and 'dist/MusicalPredator-v1.0.0-Windows-x64.zip'
 """
 
 import os
@@ -14,7 +14,7 @@ import PyInstaller.__main__
 
 def build():
     print("=" * 80)
-    print("BUILDING PREDATOR SYNC SUITE: Application & Standalone Installer")
+    print("BUILDING MUSICALPREDATOR: Application & Standalone Installer")
     print("=" * 80)
 
     project_root = os.path.dirname(os.path.abspath(__file__))
@@ -33,22 +33,24 @@ def build():
 
     # Terminate any running instances
     try:
+        subprocess.run(["taskkill", "/F", "/IM", "MusicalPredator.exe"], capture_output=True)
+        subprocess.run(["taskkill", "/F", "/IM", "MusicalPredator-Setup.exe"], capture_output=True)
         subprocess.run(["taskkill", "/F", "/IM", "PredatorSync.exe"], capture_output=True)
         subprocess.run(["taskkill", "/F", "/IM", "PredatorSync-Setup.exe"], capture_output=True)
     except Exception:
         pass
 
     # --------------------------------------------------------------------------
-    # STAGE 1: Compile Standalone Application (PredatorSync.exe)
+    # STAGE 1: Compile Standalone Application (MusicalPredator.exe)
     # --------------------------------------------------------------------------
     print("\n" + "-" * 80)
-    print("STAGE 1: Compiling Standalone App: dist/PredatorSync.exe")
+    print("STAGE 1: Compiling Standalone App: dist/MusicalPredator.exe")
     print("-" * 80)
 
     app_entry = os.path.join(project_root, "run_app.pyw")
     app_args = [
         app_entry,
-        "--name=PredatorSync",
+        "--name=MusicalPredator",
         "--noconsole",          # Pure Windows GUI application (no CMD prompt)
         "--clean",
         "--onefile",            # Standalone single executable
@@ -80,7 +82,7 @@ def build():
 
     PyInstaller.__main__.run(app_args)
 
-    dist_exe = os.path.join(project_root, "dist", "PredatorSync.exe")
+    dist_exe = os.path.join(project_root, "dist", "MusicalPredator.exe")
     if not os.path.exists(dist_exe):
         raise RuntimeError(f"App build failed! Not found: {dist_exe}")
 
@@ -88,16 +90,16 @@ def build():
     print(f"[SUCCESS] Standalone application compiled: {dist_exe} ({exe_size_mb:.2f} MB)")
 
     # --------------------------------------------------------------------------
-    # STAGE 2: Compile Standalone Installer Wizard (PredatorSync-Setup.exe)
+    # STAGE 2: Compile Standalone Installer Wizard (MusicalPredator-Setup.exe)
     # --------------------------------------------------------------------------
     print("\n" + "-" * 80)
-    print("STAGE 2: Compiling Standalone Installer: dist/PredatorSync-Setup.exe")
+    print("STAGE 2: Compiling Standalone Installer: dist/MusicalPredator-Setup.exe")
     print("-" * 80)
 
     installer_entry = os.path.join(project_root, "installer", "setup_gui.py")
     installer_args = [
         installer_entry,
-        "--name=PredatorSync-Setup",
+        "--name=MusicalPredator-Setup",
         "--noconsole",          # GUI wizard
         "--clean",
         "--onefile",            # Single setup executable
@@ -120,7 +122,7 @@ def build():
 
     PyInstaller.__main__.run(installer_args)
 
-    setup_exe = os.path.join(project_root, "dist", "PredatorSync-Setup.exe")
+    setup_exe = os.path.join(project_root, "dist", "MusicalPredator-Setup.exe")
     if not os.path.exists(setup_exe):
         raise RuntimeError(f"Installer build failed! Not found: {setup_exe}")
 
@@ -134,14 +136,14 @@ def build():
     print("STAGE 3: Assembling Distribution Package & ZIP Archive")
     print("-" * 80)
 
-    package_dir = os.path.join(project_root, "dist", "PredatorSync-v1.0.0-Windows-x64")
+    package_dir = os.path.join(project_root, "dist", "MusicalPredator-v1.0.0-Windows-x64")
     if os.path.exists(package_dir):
         shutil.rmtree(package_dir)
     os.makedirs(package_dir, exist_ok=True)
 
     # Copy installer and standalone executable
-    shutil.copy2(setup_exe, os.path.join(package_dir, "PredatorSync-Setup.exe"))
-    shutil.copy2(dist_exe, os.path.join(package_dir, "PredatorSync.exe"))
+    shutil.copy2(setup_exe, os.path.join(package_dir, "MusicalPredator-Setup.exe"))
+    shutil.copy2(dist_exe, os.path.join(package_dir, "MusicalPredator.exe"))
 
     # Copy assets folder
     shutil.copytree(assets_dir, os.path.join(package_dir, "assets"))
@@ -150,41 +152,41 @@ def build():
     shortcut_vbs = r'''Set WshShell = CreateObject("WScript.Shell")
 strScriptDir = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName)
 strDesktop = WshShell.SpecialFolders("Desktop")
-strTarget = strScriptDir & "\PredatorSync.exe"
+strTarget = strScriptDir & "\MusicalPredator.exe"
 
-Set oShortcut = WshShell.CreateShortcut(strDesktop & "\Predator Keyboard Sync.lnk")
+Set oShortcut = WshShell.CreateShortcut(strDesktop & "\MusicalPredator.lnk")
 oShortcut.TargetPath = strTarget
 oShortcut.WorkingDirectory = strScriptDir
 oShortcut.IconLocation = strScriptDir & "\assets\predator_icon.ico, 0"
-oShortcut.Description = "Acer Predator Helios Neo 16 4-Zone RGB Music Sync"
+oShortcut.Description = "MusicalPredator - 4-Zone RGB Music Sync"
 oShortcut.Save
 Set oShortcut = Nothing
 Set WshShell = Nothing
-MsgBox "Desktop shortcut created successfully for Predator Keyboard Sync!", 64, "Predator Sync"
+MsgBox "Desktop shortcut created successfully for MusicalPredator!", 64, "MusicalPredator"
 '''
     with open(os.path.join(package_dir, "Create-Desktop-Shortcut.vbs"), "w", encoding="utf-8") as f:
         f.write(shortcut_vbs)
 
     # Setup BAT
     setup_bat = r'''@echo off
-title Predator Sync - Setup & Launcher
+title MusicalPredator - Setup & Launcher
 echo ======================================================================
-echo Acer Predator Keyboard Music Sync
+echo MusicalPredator
 echo ======================================================================
 echo.
-echo [1] Run Standalone Installer (PredatorSync-Setup.exe)
-echo [2] Launch Portable App Directly (PredatorSync.exe)
+echo [1] Run Standalone Installer (MusicalPredator-Setup.exe)
+echo [2] Launch Portable App Directly (MusicalPredator.exe)
 echo [3] Create Desktop Shortcut
 echo [4] Exit
 echo.
 set /p opt="Select an option (1-4): "
 
 if "%opt%"=="1" (
-    start "" "%~dp0PredatorSync-Setup.exe"
+    start "" "%~dp0MusicalPredator-Setup.exe"
     exit
 )
 if "%opt%"=="2" (
-    start "" "%~dp0PredatorSync.exe"
+    start "" "%~dp0MusicalPredator.exe"
     exit
 )
 if "%opt%"=="3" (
@@ -194,24 +196,24 @@ if "%opt%"=="3" (
 )
 exit
 '''
-    with open(os.path.join(package_dir, "Setup-PredatorSync.bat"), "w", encoding="utf-8") as f:
+    with open(os.path.join(package_dir, "Setup-MusicalPredator.bat"), "w", encoding="utf-8") as f:
         f.write(setup_bat)
 
     # README
     readme = """===============================================================================
-ACER PREDATOR KEYBOARD MUSIC SYNC (v1.0.0)
+MUSICALPREDATOR (v1.0.0)
 Hardware Optimized for Acer Predator Helios Neo 16 (PHN16-71) 4-Zone RGB
 ===============================================================================
 
 INSTALLATION OPTIONS:
-1. Recommended: Run 'PredatorSync-Setup.exe'
-   - Elegant Predator setup wizard.
-   - Installs to %LOCALAPPDATA%\\Programs\\PredatorSync (Zero UAC elevation required).
+1. Recommended: Run 'MusicalPredator-Setup.exe'
+   - Elegant setup wizard.
+   - Installs to %LOCALAPPDATA%\\Programs\\MusicalPredator (Zero UAC elevation required).
    - Creates Desktop & Start Menu shortcuts with high-resolution Predator icon.
    - Configures automatic Start on Windows Boot (silent start into system tray).
    - Registers in Windows Settings -> Apps -> Installed Apps with clean uninstaller.
 
-2. Portable Mode: Run 'PredatorSync.exe' directly
+2. Portable Mode: Run 'MusicalPredator.exe' directly
    - Single standalone executable with zero installation needed.
 
 FEATURES:
@@ -234,7 +236,7 @@ REQUIREMENTS:
         f.write(readme)
 
     # ZIP Package
-    zip_path = os.path.join(project_root, "dist", "PredatorSync-v1.0.0-Windows-x64.zip")
+    zip_path = os.path.join(project_root, "dist", "MusicalPredator-v1.0.0-Windows-x64.zip")
     print(f"[*] Packaging ZIP archive: {zip_path}...")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(package_dir):

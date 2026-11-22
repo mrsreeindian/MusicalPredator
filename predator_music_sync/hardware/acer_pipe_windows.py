@@ -292,8 +292,10 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         if any_diff:
             return True
 
-        # Settling frame: if subtle difference exists and no update was sent in >250ms, update hardware
-        if max_diff > 0 and (now - self._last_send_time > 0.25):
+        # Keepalive / settling frame:
+        # Acer Lighting Service and EC firmware require regular writes (every 180ms - 250ms)
+        # to prevent background services (PredatorSense) or EC watchdogs from restoring OEM default profile (white).
+        if (now - self._last_send_time) >= 0.20:
             return True
 
         return False

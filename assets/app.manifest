@@ -3,10 +3,10 @@
   <assemblyIdentity
     version="1.0.0.0"
     processorArchitecture="*"
-    name="Acer.Predator.PredatorSync"
+    name="Acer.Predator.MusicalPredator"
     type="win32"
   />
-  <description>Acer Predator Keyboard Music Sync</description>
+  <description>MusicalPredator</description>
   
   <!-- Windows Common Controls v6 for modern sleek UI rendering -->
   <dependency>

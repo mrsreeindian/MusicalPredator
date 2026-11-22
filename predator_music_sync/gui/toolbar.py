@@ -228,7 +228,7 @@ class PredatorMusicToolbar:
     def create_window(self):
         """Builds and initializes the desktop application window with clean centering."""
         self.root = tk.Tk()
-        self.root.title("Predator Keyboard Music Sync")
+        self.root.title("MusicalPredator")
 
         # Set taskbar and titlebar application icon
         icon_candidates = [
@@ -313,7 +313,7 @@ class PredatorMusicToolbar:
         left.pack(side="left", padx=14, fill="y")
 
         lbl_logo = tk.Label(
-            left, text="▲ PREDATOR SYNC",
+            left, text="▲ MUSICALPREDATOR",
             font=(self.FONT_FAMILY, 9, "bold"), fg=self.TEXT_WHITE, bg=self.SURFACE_PANEL
         )
         lbl_logo.pack(side="left")
@@ -1673,6 +1673,8 @@ class PredatorMusicToolbar:
         self._current_mode = mode_name
         if self._combo_mode and self._combo_mode.get() != mode_name:
             self._combo_mode.set(mode_name)
+        if mode_name in ("Static Album Art", "Static Album Dominant"):
+            self._handle_theme_change_direct("Auto (Album Cover)")
         if self.on_mode_change:
             self.on_mode_change(mode_name)
 

@@ -1,6 +1,6 @@
 """
 Windows Autostart (Start on Boot) Management
-Uses Python standard library 'winreg' to register PredatorSync in
+Uses Python standard library 'winreg' to register MusicalPredator in
 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run with '--minimized' flag
 for seamless background startup into the system tray on Windows boot.
 """
@@ -9,13 +9,13 @@ import os
 import sys
 
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-APP_VALUE_NAME = "PredatorMusicSync"
+APP_VALUE_NAME = "MusicalPredator"
 
 
 def get_launch_command() -> str:
     """
-    Determines the appropriate command to launch PredatorSync minimized on Windows boot.
-    Supports both compiled standalone binary (dist/PredatorSync.exe) and Python source runtime.
+    Determines the appropriate command to launch MusicalPredator minimized on Windows boot.
+    Supports both compiled standalone binary (dist/MusicalPredator.exe) and Python source runtime.
     """
     if getattr(sys, "frozen", False):
         # Running as PyInstaller compiled executable
@@ -35,7 +35,7 @@ def get_launch_command() -> str:
 
 
 def is_autostart_enabled() -> bool:
-    """Checks whether PredatorSync is registered in Windows Startup (HKCU Run)."""
+    """Checks whether MusicalPredator is registered in Windows Startup (HKCU Run)."""
     if sys.platform != "win32":
         return False
 

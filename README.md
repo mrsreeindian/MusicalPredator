@@ -1,4 +1,4 @@
-# Predator Keyboard Music Sync
+# MusicalPredator
 
 Real-time audio-reactive RGB synchronization and album art color illumination for the 4-zone keyboard on Acer Predator Helios Neo 16 laptops.
 
@@ -6,7 +6,7 @@ Real-time audio-reactive RGB synchronization and album art color illumination fo
 
 ## Overview
 
-**Predator Keyboard Music Sync** connects system audio playback directly to your laptop's 4-zone RGB backlit keyboard. It samples loopback audio, performs fast Fourier transform (FFT) frequency analysis and transient beat detection, extracts album art color palettes via Windows System Media Transport Controls (SMTC), and updates physical LED zones at up to 60 FPS.
+**MusicalPredator** connects system audio playback directly to your laptop's 4-zone RGB backlit keyboard. It samples loopback audio, performs fast Fourier transform (FFT) frequency analysis and transient beat detection, extracts album art color palettes via Windows System Media Transport Controls (SMTC), and updates physical LED zones at up to 60 FPS.
 
 ---
 
@@ -33,12 +33,12 @@ Real-time audio-reactive RGB synchronization and album art color illumination fo
 ## Installation
 
 ### Option 1: Standalone Installer (Recommended)
-1. Download `PredatorSync-Setup.exe` from the latest release.
-2. Run the setup wizard to install to `%LOCALAPPDATA%\Programs\PredatorSync`.
+1. Download `MusicalPredator-Setup.exe` from the latest release.
+2. Run the setup wizard to install to `%LOCALAPPDATA%\Programs\MusicalPredator`.
 3. Choose shortcut and startup options, then click **Finish**.
 
 ### Option 2: Portable Executable
-1. Download `PredatorSync.exe` from the latest release.
+1. Download `MusicalPredator.exe` from the latest release.
 2. Place it in any folder and run directly.
 
 ---
@@ -81,9 +81,9 @@ python run_benchmark.py
 python build_exe.py
 ```
 Compiled outputs will be generated in the `dist/` directory:
-- `dist/PredatorSync.exe`: Standalone portable executable
-- `dist/PredatorSync-Setup.exe`: Standalone setup wizard installer
-- `dist/PredatorSync-v1.0.0-Windows-x64.zip`: Full release distribution package
+- `dist/MusicalPredator.exe`: Standalone portable executable
+- `dist/MusicalPredator-Setup.exe`: Standalone setup wizard installer
+- `dist/MusicalPredator-v1.0.0-Windows-x64.zip`: Full release distribution package
 
 ---
 

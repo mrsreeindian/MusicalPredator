@@ -223,6 +223,7 @@ class PredatorSyncService:
 
     def _service_loop(self):
         last_time = time.perf_counter()
+        last_dispatch_time = 0.0
         last_dispatched_colors: Optional[List[RGBColor]] = None
 
         while self._is_running:
@@ -253,15 +254,24 @@ class PredatorSyncService:
             is_silent = (audio_state.overall_energy < 0.05 or getattr(audio_state, "is_silent", False))
             colors_unchanged = (last_dispatched_colors is not None and zone_colors == last_dispatched_colors)
 
-            # 3. Hardware dispatch (skip redundant pipe writes if colors unchanged and not beat)
-            if not colors_unchanged or audio_state.is_beat:
+            # In static modes, beats must NEVER trigger beat-latching, white flashes, or strobe overrides
+            effective_is_beat = False if is_static else audio_state.is_beat
+
+            # 3. Hardware dispatch:
+            # Dispatch when colors change, on musical beats (for dynamic animations),
+            # or on a 200ms keepalive timer so the hardware pipe never goes silent.
+            now = time.perf_counter()
+            should_dispatch = (not colors_unchanged) or effective_is_beat or ((now - last_dispatch_time) >= 0.20)
+            if should_dispatch:
                 try:
-                    self.controller.set_all_zones(zone_colors, is_beat=audio_state.is_beat)
+                    self.controller.set_all_zones(zone_colors, is_beat=effective_is_beat)
                     last_dispatched_colors = list(zone_colors)
+                    last_dispatch_time = now
                 except TypeError:
                     try:
                         self.controller.set_all_zones(zone_colors)
                         last_dispatched_colors = list(zone_colors)
+                        last_dispatch_time = now
                     except Exception:
                         pass
                 except Exception:
@@ -275,10 +285,12 @@ class PredatorSyncService:
                     pass
 
             # 5. Adaptive Pacing:
-            # When in pure silence or static mode with unchanged colors, throttle from 60 FPS (16.6ms) to 15 FPS (66.6ms)
-            # This drops service loop CPU to ~0.0% while maintaining instant reactivity when sound returns.
-            if (is_silent or (is_static and colors_unchanged)) and not audio_state.is_beat:
-                target_frame_time = 1.0 / 15.0  # 15 FPS
+            # Static modes run at steady 15 FPS (zero CPU).
+            # Dynamic modes throttle to 15 FPS during silence, and run at 60 FPS during audio playback.
+            if is_static:
+                target_frame_time = 1.0 / 15.0  # 15 FPS steady for static mode
+            elif is_silent and not audio_state.is_beat:
+                target_frame_time = 1.0 / 15.0  # 15 FPS during silence
             else:
                 target_frame_time = self._frame_time  # 60 FPS
 
@@ -296,6 +308,10 @@ class PredatorSyncService:
                 self.animation = ANIMATION_REGISTRY[mode_name]()
                 self.animation.speed = self._current_speed
                 self.animation.flash_intensity = self._current_flash
+                if mode_name in ("Static Album Art", "Static Album Dominant"):
+                    # Immediately ensure palette is loaded from current track if available
+                    if self._latest_track and self._latest_track.cover_path and os.path.exists(self._latest_track.cover_path):
+                        self.current_palette = self.color_extractor.extract_from_image_path(self._latest_track.cover_path)
 
     def set_speed(self, val: float):
         with self._lock:
@@ -317,11 +333,15 @@ class PredatorSyncService:
                 if preset is not None:
                     self.current_palette = preset
                 else:
-                    cur_track = self.media_engine.get_current_media_track()
-                    if cur_track and cur_track.cover_path and os.path.exists(cur_track.cover_path):
-                        self.current_palette = self.color_extractor.extract_from_image_path(cur_track.cover_path)
+                    if self._latest_track and self._latest_track.cover_path and os.path.exists(self._latest_track.cover_path):
+                        self.current_palette = self.color_extractor.extract_from_image_path(self._latest_track.cover_path)
                     else:
-                        self.current_palette = ColorPaletteExtractor.DEFAULT_PALETTES[0]
+                        cur_track = self.media_engine.get_current_media_track()
+                        if cur_track and cur_track.cover_path and os.path.exists(cur_track.cover_path):
+                            self._latest_track = cur_track
+                            self.current_palette = self.color_extractor.extract_from_image_path(cur_track.cover_path)
+                        else:
+                            self.current_palette = ColorPaletteExtractor.DEFAULT_PALETTES[0]
 
     def set_brightness(self, val: int):
         self.controller.brightness = int(val)
@@ -387,3 +407,7 @@ class PredatorSyncService:
                     print(f"Error switching device: {e}", flush=True)
 
         threading.Thread(target=_switch, daemon=True, name="AudioDeviceSwitchWorker").start()
+
+
+# Modern Alias
+MusicalPredatorService = PredatorSyncService

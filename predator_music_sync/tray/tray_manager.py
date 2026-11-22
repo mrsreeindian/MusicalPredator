@@ -101,7 +101,7 @@ class PredatorTrayManager:
         """Constructs the right-click tray context menu."""
         return Menu(
             item(
-                "▲ Open Predator Sync Dashboard",
+                "▲ Open MusicalPredator",
                 self._handle_show_window,
                 default=True
             ),
@@ -158,9 +158,9 @@ class PredatorTrayManager:
         try:
             icon_img = generate_predator_tray_icon()
             self._icon = pystray.Icon(
-                name="PredatorMusicSync",
+                name="MusicalPredator",
                 icon=icon_img,
-                title="Predator Keyboard Music Sync (Helios Neo 16)",
+                title="MusicalPredator (Helios Neo 16)",
                 menu=self.build_menu()
             )
             self._icon.run_detached()
@@ -182,8 +182,8 @@ class PredatorTrayManager:
             self._has_notified_tray = True
             try:
                 self._icon.notify(
-                    "Predator Sync is running in the background.\nDouble-click this tray icon to open dashboard.",
-                    "Predator Keyboard Music Sync"
+                    "MusicalPredator is running in the background.\nDouble-click this tray icon to open dashboard.",
+                    "MusicalPredator"
                 )
             except Exception:
                 pass

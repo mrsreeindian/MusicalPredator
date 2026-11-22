@@ -1,7 +1,7 @@
 """
-Predator Keyboard Music Sync - Predator iCUE Pro Standalone Setup Wizard
+MusicalPredator - Standalone Setup Wizard
 Professional, zero-UAC user-level Windows Installer.
-Installs to %LOCALAPPDATA%\\Programs\\PredatorSync, creates shortcuts,
+Installs to %LOCALAPPDATA%\Programs\MusicalPredator, creates shortcuts,
 configures autostart, and registers in Windows Add/Remove Programs.
 """
 
@@ -17,7 +17,7 @@ from typing import Optional
 from PIL import Image, ImageTk, ImageDraw
 
 
-# Theme Palette (Predator iCUE Pure Black Aesthetic)
+# Theme Palette (MusicalPredator Dark Aesthetic)
 COLOR_BG = "#000000"
 COLOR_PANEL = "#0B0B0B"
 COLOR_CARD = "#121212"
@@ -32,15 +32,15 @@ FONT_MONO = "Consolas"
 
 
 def get_default_install_dir() -> str:
-    """Returns %LOCALAPPDATA%\\Programs\\PredatorSync for zero-UAC installation."""
+    """Returns %LOCALAPPDATA%\\Programs\\MusicalPredator for zero-UAC installation."""
     local_app_data = os.environ.get("LOCALAPPDATA")
     if not local_app_data:
         local_app_data = os.path.expanduser(r"~\AppData\Local")
-    return os.path.join(local_app_data, "Programs", "PredatorSync")
+    return os.path.join(local_app_data, "Programs", "MusicalPredator")
 
 
 def get_payload_paths():
-    """Finds bundled or local PredatorSync.exe and assets."""
+    """Finds bundled or local MusicalPredator.exe and assets."""
     if getattr(sys, "frozen", False):
         base_dir = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     else:
@@ -48,9 +48,11 @@ def get_payload_paths():
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     candidates_exe = [
+        os.path.join(base_dir, "payload", "MusicalPredator.exe"),
+        os.path.join(base_dir, "dist", "MusicalPredator.exe"),
+        os.path.join(base_dir, "MusicalPredator.exe"),
         os.path.join(base_dir, "payload", "PredatorSync.exe"),
         os.path.join(base_dir, "dist", "PredatorSync.exe"),
-        os.path.join(base_dir, "PredatorSync.exe"),
     ]
     exe_path = None
     for c in candidates_exe:
@@ -72,10 +74,10 @@ def get_payload_paths():
     return exe_path, assets_path
 
 
-class PredatorSetupWizard:
+class MusicalPredatorSetupWizard:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Predator Keyboard Music Sync // Setup Wizard")
+        self.root.title("MusicalPredator // Setup Wizard")
         self.root.configure(bg=COLOR_BG)
         self.root.resizable(False, False)
 
@@ -143,7 +145,7 @@ class PredatorSetupWizard:
 
         lbl_title = tk.Label(
             info_box,
-            text="PREDATOR SYNC // INSTALLER",
+            text="MUSICALPREDATOR // SETUP",
             font=(FONT_FAMILY, 11, "bold"),
             fg=COLOR_TEXT,
             bg=COLOR_PANEL
@@ -261,7 +263,7 @@ class PredatorSetupWizard:
         # Title
         tk.Label(
             inner,
-            text="Welcome to Predator Sync Setup",
+            text="Welcome to MusicalPredator Setup",
             font=(FONT_FAMILY, 15, "bold"),
             fg=COLOR_TEXT,
             bg=COLOR_CARD
@@ -269,7 +271,7 @@ class PredatorSetupWizard:
 
         tk.Label(
             inner,
-            text="This wizard will install Predator Keyboard Music Sync on your system.",
+            text="This wizard will install MusicalPredator on your system.",
             font=(FONT_FAMILY, 9),
             fg=COLOR_MUTED,
             bg=COLOR_CARD
@@ -342,7 +344,7 @@ class PredatorSetupWizard:
 
         tk.Label(
             inner,
-            text="Predator Sync will be installed to user folder without requiring UAC elevation:",
+            text="MusicalPredator will be installed to user folder without requiring UAC elevation:",
             font=(FONT_FAMILY, 8),
             fg=COLOR_MUTED,
             bg=COLOR_CARD
@@ -422,7 +424,7 @@ class PredatorSetupWizard:
 
         cb3 = tk.Checkbutton(
             opt_frame,
-            text="Start Predator Sync with Windows on Boot (Silently to Tray)",
+            text="Start MusicalPredator with Windows on Boot (Silently to Tray)",
             variable=self.var_autostart,
             font=(FONT_FAMILY, 9),
             fg=COLOR_TEXT,
@@ -455,7 +457,7 @@ class PredatorSetupWizard:
 
         tk.Label(
             inner,
-            text="Installing Predator Sync...",
+            text="Installing MusicalPredator...",
             font=(FONT_FAMILY, 13, "bold"),
             fg=COLOR_TEXT,
             bg=COLOR_CARD
@@ -510,6 +512,7 @@ class PredatorSetupWizard:
             # 1. Terminate any running instances
             self._set_progress(20, "Checking running processes...")
             try:
+                subprocess.run(["taskkill", "/F", "/IM", "MusicalPredator.exe"], capture_output=True)
                 subprocess.run(["taskkill", "/F", "/IM", "PredatorSync.exe"], capture_output=True)
             except Exception:
                 pass
@@ -518,10 +521,10 @@ class PredatorSetupWizard:
             # 2. Extract payload
             exe_src, assets_src = get_payload_paths()
             if not exe_src or not os.path.exists(exe_src):
-                raise RuntimeError("PredatorSync.exe payload not found in installer package.")
+                raise RuntimeError("MusicalPredator.exe payload not found in installer package.")
 
-            self._set_progress(40, "Copying PredatorSync.exe binary...")
-            target_exe = os.path.join(target_dir, "PredatorSync.exe")
+            self._set_progress(40, "Copying MusicalPredator.exe binary...")
+            target_exe = os.path.join(target_dir, "MusicalPredator.exe")
             shutil.copy2(exe_src, target_exe)
             time.sleep(0.2)
 
@@ -540,7 +543,7 @@ class PredatorSetupWizard:
             if self.var_shortcut_desktop.get():
                 self._set_progress(70, "Creating Desktop shortcut...")
                 self._create_shortcut(
-                    shortcut_name="Predator Keyboard Sync.lnk",
+                    shortcut_name="MusicalPredator.lnk",
                     folder=os.path.expanduser(r"~\Desktop"),
                     target=target_exe,
                     work_dir=target_dir,
@@ -550,10 +553,10 @@ class PredatorSetupWizard:
 
             if self.var_shortcut_start.get():
                 self._set_progress(80, "Creating Start Menu shortcuts...")
-                start_dir = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Predator Sync")
+                start_dir = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\MusicalPredator")
                 os.makedirs(start_dir, exist_ok=True)
                 self._create_shortcut(
-                    shortcut_name="Predator Keyboard Sync.lnk",
+                    shortcut_name="MusicalPredator.lnk",
                     folder=start_dir,
                     target=target_exe,
                     work_dir=target_dir,
@@ -603,22 +606,27 @@ oShortcut.Description = "{desc}"
         """Creates clean uninstallation scripts."""
         uninst_bat_path = os.path.join(install_dir, "uninstall.bat")
         bat_content = f"""@echo off
-title Predator Sync Uninstaller
+title MusicalPredator Uninstaller
 echo ======================================================================
-echo Uninstalling Predator Keyboard Music Sync...
+echo Uninstalling MusicalPredator...
 echo ======================================================================
 
 :: Kill running instances
+taskkill /F /IM MusicalPredator.exe >nul 2>&1
 taskkill /F /IM PredatorSync.exe >nul 2>&1
 
 :: Remove Autostart Key
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "MusicalPredator" /f >nul 2>&1
 reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "PredatorMusicSync" /f >nul 2>&1
 
 :: Remove Uninstall Registration Key
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MusicalPredator" /f >nul 2>&1
 reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PredatorSync" /f >nul 2>&1
 
 :: Remove Shortcuts
+del /Q "%USERPROFILE%\\Desktop\\MusicalPredator.lnk" >nul 2>&1
 del /Q "%USERPROFILE%\\Desktop\\Predator Keyboard Sync.lnk" >nul 2>&1
+rd /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\MusicalPredator" >nul 2>&1
 rd /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Predator Sync" >nul 2>&1
 
 :: Delete installation files (self-deleting batch)
@@ -632,14 +640,14 @@ exit
             f.write(bat_content)
 
     def _register_uninstall_entry(self, install_dir: str, exe_path: str, ico_path: str):
-        """Registers the application in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PredatorSync."""
+        """Registers the application in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MusicalPredator."""
         try:
             import winreg
-            uninstall_key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PredatorSync"
+            uninstall_key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\MusicalPredator"
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, uninstall_key, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "Predator Keyboard Music Sync")
+                winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "MusicalPredator")
                 winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, "1.0.0")
-                winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "Acer Predator Community")
+                winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "Predator Community")
                 winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, install_dir)
                 if os.path.exists(ico_path):
                     winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, ico_path)
@@ -658,7 +666,7 @@ exit
             run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
             cmd = f'"{exe_path}" --minimized'
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, "PredatorMusicSync", 0, winreg.REG_SZ, cmd)
+                winreg.SetValueEx(key, "MusicalPredator", 0, winreg.REG_SZ, cmd)
         except Exception as e:
             print(f"Warning: Failed to set autostart: {e}")
 
@@ -687,7 +695,7 @@ exit
 
         tk.Label(
             inner,
-            text="Predator Keyboard Music Sync has been installed successfully.",
+            text="MusicalPredator has been installed successfully.",
             font=(FONT_FAMILY, 9),
             fg=COLOR_TEXT,
             bg=COLOR_CARD
@@ -711,7 +719,7 @@ exit
         # Launch checkbox
         cb_launch = tk.Checkbutton(
             inner,
-            text="Launch Predator Sync now",
+            text="Launch MusicalPredator now",
             variable=self.var_launch_now,
             font=(FONT_FAMILY, 10, "bold"),
             fg=COLOR_ACCENT,
@@ -734,7 +742,7 @@ exit
         elif self.current_screen == 4:
             # Finish action
             if self.var_launch_now.get():
-                target_exe = os.path.join(self.var_install_dir.get(), "PredatorSync.exe")
+                target_exe = os.path.join(self.var_install_dir.get(), "MusicalPredator.exe")
                 if os.path.exists(target_exe):
                     subprocess.Popen([target_exe], cwd=self.var_install_dir.get())
             self.root.destroy()
@@ -742,7 +750,7 @@ exit
 
 def main():
     root = tk.Tk()
-    app = PredatorSetupWizard(root)
+    app = MusicalPredatorSetupWizard(root)
     root.mainloop()
 
 

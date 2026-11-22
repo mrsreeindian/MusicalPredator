@@ -206,7 +206,7 @@ class TestComponentAudit(unittest.TestCase):
         item_texts = [str(it.text) for it in menu_items]
 
         # Verify key menu items
-        self.assertTrue(any("Open Predator Sync Dashboard" in t for t in item_texts))
+        self.assertTrue(any("Open MusicalPredator" in t for t in item_texts))
         self.assertTrue(any("Lighting Enabled" in t for t in item_texts))
         self.assertTrue(any("Quick Modes" in t for t in item_texts))
         self.assertTrue(any("Hide to System Tray" in t for t in item_texts))
@@ -415,6 +415,19 @@ class TestComponentAudit(unittest.TestCase):
         self.assertTrue(all(len(c) == 3 for c in c_fallback))
         print("  [PASS] Fallback safety verified: Handles None palette without exceptions.")
 
+        # Test Hardware Keepalive to prevent OEM White Reversion
+        from predator_music_sync.hardware.acer_pipe_windows import AcerLightingNamedPipeBackend
+        pipe_backend = AcerLightingNamedPipeBackend.__new__(AcerLightingNamedPipeBackend)
+        pipe_backend._brightness = 100
+        pipe_backend._last_sent_scaled = [(255, 50, 0), (0, 240, 255), (255, 200, 0), (180, 0, 255)]
+        pipe_backend._last_send_time = 100.0
+
+        # Colors identical, time elapsed < 200ms -> should suppress bus flood
+        self.assertFalse(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=100.05))
+        # Colors identical, time elapsed >= 200ms -> MUST dispatch keepalive frame to prevent OEM timeout to white!
+        self.assertTrue(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=100.25))
+        print("  [PASS] Hardware Keepalive verified: Transmits 5 Hz refresh frames to prevent OEM white fallback.")
+
     # =========================================================================
     # 6. AUDIT: RESOURCE OPTIMIZATION & AUTOSTART
     # =========================================================================
@@ -432,7 +445,7 @@ class TestComponentAudit(unittest.TestCase):
         initial_state = is_autostart_enabled()
         set_autostart(True)
         self.assertTrue(is_autostart_enabled())
-        print("  [PASS] Autostart enabled via HKCU\\...\\Run\\PredatorMusicSync.")
+        print("  [PASS] Autostart enabled via HKCU\\...\\Run\\MusicalPredator.")
 
         set_autostart(False)
         self.assertFalse(is_autostart_enabled())
