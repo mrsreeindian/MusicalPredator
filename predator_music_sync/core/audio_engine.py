@@ -45,6 +45,8 @@ class AudioBeatSyncEngine:
         self.band_gains = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
         self._stream: Optional[sd.InputStream] = None
         self._is_running = False
+        self._is_paused = False
+        self._last_reconnect_time = 0.0
         self._state = AudioBeatState()
         self._lock = threading.Lock()
 
@@ -255,6 +257,7 @@ class AudioBeatSyncEngine:
 
     def stop(self):
         self._is_running = False
+        self._is_paused = False
         if self._stream:
             try:
                 self._stream.stop()
@@ -263,7 +266,72 @@ class AudioBeatSyncEngine:
                 pass
             self._stream = None
 
+    def pause(self):
+        """
+        Suspends audio stream capture, dropping CPU to 0.0%.
+        Resets active state to pure silence.
+        """
+        with self._lock:
+            self._is_paused = True
+            self._state.is_beat = False
+            self._state.is_hard_kick = False
+            self._state.beat_strength = 0.0
+            self._state.overall_energy = 0.0
+            self._state.smoothed_bands = np.zeros(4, dtype=np.float32)
+            self._state.band_energies = np.zeros(4, dtype=np.float32)
+            self._state.is_silent = True
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+
+    def resume(self):
+        """Resumes audio stream capture from paused state."""
+        with self._lock:
+            if not self._is_paused:
+                return
+            self._is_paused = False
+        if self._is_running:
+            if self._stream is not None:
+                try:
+                    self._stream.start()
+                except Exception:
+                    self.set_device(self.device_index)
+            else:
+                self.start()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
+
+    def _check_stream_health(self):
+        """Auto-recovers audio stream if disconnected or stopped unexpectedly."""
+        if not self._is_running or self._is_paused:
+            return
+        now = time.time()
+        if (now - self._last_reconnect_time) < 2.0:
+            return
+        # If stream died or was invalidated (e.g. USB headset unplugged)
+        stream_dead = (self._stream is None) or (hasattr(self._stream, "active") and not self._stream.active)
+        if stream_dead:
+            self._last_reconnect_time = now
+            try:
+                # Attempt to restart or find fallback optimal device
+                self.device_index, self.sample_rate = self._find_optimal_device_and_rate(prefer_device=self.device_index)
+                if self._stream:
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+                self.start()
+            except Exception:
+                pass
+
     def get_state(self) -> AudioBeatState:
+        self._check_stream_health()
         with self._lock:
             st = AudioBeatState()
             st.is_beat = self._state.is_beat
@@ -279,15 +347,42 @@ class AudioBeatSyncEngine:
 
     def _audio_callback(self, indata, frames, time_info, status):
         t0 = time.perf_counter()
-        if not self._is_running:
+        if not self._is_running or self._is_paused:
             return
+
+        if status:
+            # Underflow/overflow notification; sounddevice handles buffer recycling internally
+            pass
 
         if indata.ndim > 1:
             mono = np.mean(indata, axis=1)
         else:
             mono = indata.flatten()
 
+        # Fast RMS check on raw signal before performing heavy FFT calculations
         rms = float(np.sqrt(np.mean(mono ** 2)))
+
+        # =========================================================================
+        # DYNAMIC NOISE FLOOR GATING:
+        # If signal is below noise threshold, snap all energies to 0 immediately.
+        # Skip FFT completely in silence to minimize CPU utilization to ~0.0%.
+        # =========================================================================
+        if rms < self.noise_floor:
+            t_end = time.perf_counter()
+            with self._lock:
+                self._state.is_beat = False
+                self._state.is_hard_kick = False
+                self._state.beat_strength = 0.0
+                self._state.overall_energy = 0.0
+                self._state.smoothed_bands = np.maximum(0.0, self._state.smoothed_bands * 0.70)
+                if np.max(self._state.smoothed_bands) < 0.01:
+                    self._state.smoothed_bands = np.zeros(4, dtype=np.float32)
+                self._state.band_energies = np.zeros(4, dtype=np.float32)
+                self._state.is_silent = True
+                self._state.latency_ms = (t_end - t0) * 1000.0
+            self._prev_fft = None
+            return
+
         fft_data = np.abs(np.fft.rfft(mono * self._window))
 
         # 4 Band energies
@@ -298,11 +393,7 @@ class AudioBeatSyncEngine:
 
         raw_bands = np.array([e_sub, e_low, e_mid, e_treble], dtype=np.float32) * self.band_gains
 
-        # =========================================================================
-        # DYNAMIC NOISE FLOOR GATING:
-        # If signal is below noise threshold, snap all energies to 0 and suppress beats.
-        # Silence must remain pure silence (no false triggers or ambient room noise).
-        # =========================================================================
+        # Secondary noise check for high-frequency hiss or background ambient noise
         if rms < self.noise_floor and np.max(raw_bands) < (self.noise_floor * 4.0):
             t_end = time.perf_counter()
             with self._lock:
@@ -310,7 +401,6 @@ class AudioBeatSyncEngine:
                 self._state.is_hard_kick = False
                 self._state.beat_strength = 0.0
                 self._state.overall_energy = 0.0
-                # Smoothly drop bands to absolute zero
                 self._state.smoothed_bands = np.maximum(0.0, self._state.smoothed_bands * 0.70)
                 if np.max(self._state.smoothed_bands) < 0.01:
                     self._state.smoothed_bands = np.zeros(4, dtype=np.float32)

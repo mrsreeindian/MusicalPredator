@@ -4,14 +4,25 @@ Used for real-time visualization, testing, multi-pass benchmarking, and fallback
 """
 
 import time
-from typing import List, Tuple, Optional, Callable
+from typing import List, Tuple, Optional, Callable, Dict, Any
 from .base import KeyboardControllerBase
+from .device_detector import (
+    detect_laptop_model,
+    KeyboardType,
+    LaptopModelInfo,
+    map_4zone_to_n,
+    map_auxiliary_device_colors
+)
 
 class VirtualKeyboardBackend(KeyboardControllerBase):
     """
     Virtual in-memory 4-zone RGB keyboard with precise telemetry,
     callback notifications for GUI rendering, and dispatch benchmarking.
+    Supports dynamic laptop model profiles (Per-Key RGB, 4-Zone, 3-Zone, 1-Zone, and auxiliary devices).
     """
+
+    map_4zone_to_n = staticmethod(map_4zone_to_n)
+    map_auxiliary_device_colors = staticmethod(map_auxiliary_device_colors)
 
     def __init__(self, on_update_callback: Optional[Callable[[List[Tuple[int, int, int]]], None]] = None):
         super().__init__()
@@ -21,6 +32,42 @@ class VirtualKeyboardBackend(KeyboardControllerBase):
         self._last_dispatch_time: float = 0.0
         self._dispatch_latencies: List[float] = []
         self._current_mode: int = 0  # 0: custom/static
+
+        # Dynamic model info & device expansion
+        self.model_info: LaptopModelInfo = detect_laptop_model()
+        self.sync_auxiliary: bool = True
+        self.devices: List[Dict[str, Any]] = []
+        self.primary_led_count: int = self.model_info.zone_count
+        self.refresh_devices()
+
+    def refresh_devices(self):
+        """Refreshes simulated devices matching the active laptop model."""
+        self.model_info = detect_laptop_model()
+        kb_zones = self.model_info.zone_count if self.model_info else 4
+        self.devices = [{
+            "index": 0,
+            "name": "Keyboard",
+            "type": "Keyboard",
+            "led_count": kb_zones,
+            "is_per_key": (kb_zones > 4)
+        }]
+        if self.model_info and self.model_info.has_rear_lightbar:
+            self.devices.append({
+                "index": 1,
+                "name": "Rear Lightbar",
+                "type": "Lightbar",
+                "led_count": 12,
+                "is_per_key": False
+            })
+        if self.model_info and self.model_info.has_lid_logo:
+            self.devices.append({
+                "index": 2,
+                "name": "Lid Logo",
+                "type": "Logo",
+                "led_count": 1,
+                "is_per_key": False
+            })
+        self.primary_led_count = kb_zones
 
     @property
     def frame_count(self) -> int:

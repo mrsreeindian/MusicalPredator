@@ -20,6 +20,7 @@ import sys
 import json
 import time
 import math
+import ctypes
 import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
@@ -31,6 +32,7 @@ from ..core.media_engine import MediaTrackInfo
 from ..core.audio_engine import AudioBeatState
 from ..core.animations import ANIMATION_REGISTRY
 from ..utils.autostart import is_autostart_enabled, set_autostart
+from ..hardware.device_detector import detect_laptop_model, LaptopModelInfo, KeyboardType
 
 
 def _rgb_to_hex(rgb: RGBColor) -> str:
@@ -60,6 +62,9 @@ class PredatorMusicToolbar:
     BORDER_FOCUS = "#2E2E2E"      # Subtle hover border
     ACCENT_YELLOW = "#FFD100"    # Predator electric yellow
     ACCENT_WARN = "#FF9900"       # Warning amber
+    ACCENT_GREEN = "#00E676"      # AC wall power green
+    ACCENT_AMBER = "#FFB300"      # Battery amber
+    ACCENT_SAVER = "#FF5533"      # Battery saver warning red
     TEXT_WHITE = "#FFFFFF"        # Crisp pure white
     TEXT_SECONDARY = "#999999"    # Subtitles and section labels
     TEXT_MUTED = "#555555"        # Fine print & technical hints
@@ -85,6 +90,15 @@ class PredatorMusicToolbar:
         on_run_benchmark: Optional[Callable[[], None]] = None,
         on_window_hide: Optional[Callable[[], None]] = None,
         on_toggle_autostart: Optional[Callable[[bool], None]] = None,
+        on_toggle_battery_saver: Optional[Callable[[bool], None]] = None,
+        on_plugged_effect_change: Optional[Callable[[str], None]] = None,
+        on_battery_effect_change: Optional[Callable[[str], None]] = None,
+        on_battery_brightness_cap_change: Optional[Callable[[int], None]] = None,
+        laptop_info: Optional[LaptopModelInfo] = None,
+        on_toggle_aux_sync: Optional[Callable[[bool], None]] = None,
+        on_aux_mode_change: Optional[Callable[[str], None]] = None,
+        initial_aux_sync_enabled: bool = True,
+        initial_aux_mode: str = "Beat Pulse (Zone 2)",
         controller_name: str = "Helios Neo 16 (4-Zone)",
         is_hardware_connected: bool = True,
         audio_devices: Optional[List[Tuple[int, str]]] = None,
@@ -95,7 +109,12 @@ class PredatorMusicToolbar:
         initial_sensitivity: float = 1.15,
         initial_speed: float = 1.0,
         initial_flash: float = 0.20,
+        initial_battery_saver_disable: bool = True,
+        initial_plugged_mode: str = "Dynamic Studio EQ",
+        initial_battery_mode: str = "Static Album Art",
+        initial_battery_brightness_cap: int = 50,
     ):
+        self.laptop_info = laptop_info or detect_laptop_model()
         self.on_mode_change = on_mode_change
         self.on_sensitivity_change = on_sensitivity_change
         self.on_brightness_change = on_brightness_change
@@ -113,6 +132,12 @@ class PredatorMusicToolbar:
         self.on_run_benchmark = on_run_benchmark
         self.on_window_hide = on_window_hide
         self.on_toggle_autostart = on_toggle_autostart
+        self.on_toggle_battery_saver = on_toggle_battery_saver
+        self.on_plugged_effect_change = on_plugged_effect_change
+        self.on_battery_effect_change = on_battery_effect_change
+        self.on_battery_brightness_cap_change = on_battery_brightness_cap_change
+        self.on_toggle_aux_sync = on_toggle_aux_sync
+        self.on_aux_mode_change = on_aux_mode_change
 
         self.controller_name = controller_name
         self.is_hardware_connected = is_hardware_connected
@@ -129,6 +154,21 @@ class PredatorMusicToolbar:
         self._is_lighting_active = True
         self._is_autostart_active = is_autostart_enabled()
         self._is_gui_active: bool = True
+
+        # Power & Battery Subsystem State
+        self._is_battery_saver_disable = initial_battery_saver_disable
+        self._plugged_mode = initial_plugged_mode
+        self._battery_mode = initial_battery_mode
+        self._battery_brightness_cap = initial_battery_brightness_cap
+        self._is_plugged_in: bool = True
+        self._is_battery_saver_active: bool = False
+        self._battery_percent: int = 100
+        self._power_poll_tick: int = 0
+
+        # Auxiliary Hardware Sync State (Rear Lightbar & Lid Logo)
+        self._aux_sync_enabled = initial_aux_sync_enabled
+        self._aux_mode = initial_aux_mode
+        self._kb_key_x_rels: List[float] = []
 
         # Equalizer band gains: [Sub-Bass, Low-Mid, High-Mid, Treble]
         self._band_gains = [1.0, 1.0, 1.0, 1.0]
@@ -151,13 +191,24 @@ class PredatorMusicToolbar:
         self._pending_track: Optional[MediaTrackInfo] = None
         self._pending_state: Optional[AudioBeatState] = None
 
-        # Header Widgets
+        # Header & Hardware Model Widgets
+        self._lbl_model: Optional[tk.Label] = None
         self._lbl_hw_status: Optional[tk.Label] = None
+        self._lbl_power_status: Optional[tk.Label] = None
         self._lbl_header_track: Optional[tk.Label] = None
         self._btn_toggle: Optional[tk.Button] = None
 
-        # Full Realistic Keyboard Canvas
+        # Full Realistic Keyboard Canvas & Auxiliary Mirror
+        self._lbl_kb_matrix: Optional[tk.Label] = None
         self._canvas_kb: Optional[tk.Canvas] = None
+        self._banner_saver: Optional[tk.Frame] = None
+        self._frame_aux: Optional[tk.Frame] = None
+        self._lbl_aux_badge: Optional[tk.Label] = None
+        self._canvas_lightbar: Optional[tk.Canvas] = None
+        self._lightbar_rect: Optional[int] = None
+        self._btn_aux_toggle: Optional[tk.Button] = None
+        self._btn_aux_tab3_toggle: Optional[tk.Button] = None
+        self._combo_aux_mode: Optional[ttk.Combobox] = None
         self._kb_key_rects: List[int] = []
         self._kb_key_zones: List[int] = []
         self._kb_key_wasd: List[int] = []
@@ -212,10 +263,15 @@ class PredatorMusicToolbar:
         self._zone_toggle_btns: List[tk.Button] = []
         self._zone_color_indicators: List[Tuple[tk.Canvas, int]] = []
 
-        # Tab 4: Profiles Widgets
+        # Tab 4: Profiles & Power Efficiency Widgets
         self._entry_profile_name: Optional[tk.Entry] = None
         self._lbl_profile_status: Optional[tk.Label] = None
         self._btn_autostart: Optional[tk.Button] = None
+        self._btn_battery_saver: Optional[tk.Button] = None
+        self._combo_plugged_effect: Optional[ttk.Combobox] = None
+        self._combo_battery_effect: Optional[ttk.Combobox] = None
+        self._slider_battery_cap: Optional[tk.Scale] = None
+        self._lbl_val_battery_cap: Optional[tk.Label] = None
 
         # Tab 5: Benchmark Widgets
         self._txt_bench: Optional[scrolledtext.ScrolledText] = None
@@ -318,11 +374,11 @@ class PredatorMusicToolbar:
         )
         lbl_logo.pack(side="left")
 
-        lbl_model = tk.Label(
-            left, text="// HELIOS NEO 16",
+        self._lbl_model = tk.Label(
+            left, text=f"// {self.laptop_info.display_name.upper()}",
             font=(self.FONT_FAMILY, 7), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL
         )
-        lbl_model.pack(side="left", padx=(6, 14))
+        self._lbl_model.pack(side="left", padx=(6, 14))
 
         hw_color = self.ACCENT_YELLOW if self.is_hardware_connected else self.ACCENT_WARN
         hw_text = f"● {self.controller_name.upper()} [CONNECTED]" if self.is_hardware_connected else f"● {self.controller_name.upper()} [EMULATION]"
@@ -331,6 +387,13 @@ class PredatorMusicToolbar:
             font=(self.FONT_FAMILY, 7, "bold"), fg=hw_color, bg=self.SURFACE_PANEL
         )
         self._lbl_hw_status.pack(side="left")
+
+        # Live Power & Battery Status Badge
+        self._lbl_power_status = tk.Label(
+            left, text="⚡ PLUGGED IN",
+            font=(self.FONT_FAMILY, 7, "bold"), fg=self.ACCENT_GREEN, bg=self.SURFACE_PANEL
+        )
+        self._lbl_power_status.pack(side="left", padx=(10, 0))
 
         # Center Now Playing snippet
         center = tk.Frame(header, bg=self.SURFACE_PANEL)
@@ -377,9 +440,25 @@ class PredatorMusicToolbar:
     # 2. FULL REALISTIC KEYBOARD PREVIEW (Acer Predator Helios Neo 16)
     # =========================================================================
     def _build_keyboard_preview_section(self):
-        panel = tk.Frame(self.root, bg=self.SURFACE_PANEL, height=182, highlightthickness=1, highlightbackground=self.BORDER_HAIRLINE)
+        panel = tk.Frame(self.root, bg=self.SURFACE_PANEL, height=202, highlightthickness=1, highlightbackground=self.BORDER_HAIRLINE)
         panel.pack(fill="x", padx=14, pady=(6, 4))
         panel.pack_propagate(False)
+
+        # Unobtrusive Battery Saver Notification Banner (hidden by default)
+        self._banner_saver = tk.Frame(
+            panel, bg="#1E1400", highlightthickness=1,
+            highlightbackground="#664400", height=22
+        )
+        self._banner_saver.pack_propagate(False)
+
+        lbl_saver = tk.Label(
+            self._banner_saver,
+            text="🌙 Battery Saver Active • Keyboard lighting and audio sampling suspended to conserve power",
+            font=(self.FONT_FAMILY, 7, "bold"),
+            fg="#FFB300",
+            bg="#1E1400"
+        )
+        lbl_saver.pack(fill="both", expand=True)
 
         hdr = tk.Frame(panel, bg=self.SURFACE_PANEL)
         hdr.pack(fill="x", padx=10, pady=(3, 1))
@@ -389,10 +468,39 @@ class PredatorMusicToolbar:
             font=(self.FONT_FAMILY, 7, "bold"), fg=self.TEXT_SECONDARY, bg=self.SURFACE_PANEL
         ).pack(side="left")
 
-        tk.Label(
-            hdr, text="ACER PREDATOR HELIOS NEO 16 (PHN16-71) MATRIX • 80+ KEYS",
+        self._lbl_kb_matrix = tk.Label(
+            hdr, text=f"{self.laptop_info.model_name.upper()} MATRIX • {self.laptop_info.keyboard_type.value.upper()} • 80+ KEYS",
             font=(self.FONT_FAMILY, 7), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL
-        ).pack(side="right")
+        )
+        self._lbl_kb_matrix.pack(side="right")
+
+        # Auxiliary Device Sync Strip (Rear Lightbar & Lid Logo)
+        self._frame_aux = tk.Frame(panel, bg=self.SURFACE_PANEL, height=14)
+        self._frame_aux.pack(fill="x", padx=8, pady=(1, 2))
+        self._frame_aux.pack_propagate(False)
+
+        aux_lbl_text = "REAR LIGHTBAR & LOGO //" if self.laptop_info.has_rear_lightbar else "AUX PERIPHERALS //"
+        self._lbl_aux_badge = tk.Label(
+            self._frame_aux, text=aux_lbl_text,
+            font=(self.FONT_FAMILY, 6, "bold"), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL
+        )
+        self._lbl_aux_badge.pack(side="left", padx=(2, 6))
+
+        self._canvas_lightbar = tk.Canvas(self._frame_aux, height=8, bg="#0A0A0A", bd=0, highlightthickness=1, highlightbackground=self.BORDER_HAIRLINE)
+        self._canvas_lightbar.pack(side="left", fill="x", expand=True)
+        self._lightbar_rect = self._canvas_lightbar.create_rectangle(0, 0, 1200, 8, fill="#181818", outline="")
+
+        self._btn_aux_toggle = tk.Button(
+            self._frame_aux,
+            text="AUX SYNC: ON" if self._aux_sync_enabled else "AUX SYNC: OFF",
+            font=(self.FONT_FAMILY, 6, "bold"),
+            bg=self.ACCENT_YELLOW if self._aux_sync_enabled else "#161616",
+            fg="#000000" if self._aux_sync_enabled else self.TEXT_MUTED,
+            bd=0, padx=8, pady=0, cursor="hand2",
+            highlightthickness=1, highlightbackground=self.ACCENT_YELLOW if self._aux_sync_enabled else self.BORDER_HAIRLINE,
+            command=self._toggle_aux_sync_gui
+        )
+        self._btn_aux_toggle.pack(side="right", padx=(6, 2))
 
         self._canvas_kb = tk.Canvas(panel, height=120, bg=self.SURFACE_PANEL, bd=0, highlightthickness=0)
         self._canvas_kb.pack(fill="x", padx=8, pady=(1, 2))
@@ -452,6 +560,7 @@ class PredatorMusicToolbar:
         self._kb_key_wasd = []
         self._kb_key_arrows = []
         self._kb_zone_backs = []
+        self._kb_key_x_rels = []
 
         pad_x = 4
         pad_y = 2
@@ -464,9 +573,10 @@ class PredatorMusicToolbar:
             fill="#080808", outline=self.BORDER_HAIRLINE, width=1
         )
 
-        # 4 Zone underglow backdrops
-        zone_w = well_w / 4.0
-        for z in range(4):
+        # Underglow backdrops (adapted dynamically to zone count)
+        zone_count = self.laptop_info.zone_count if self.laptop_info.zone_count in (3, 4) else 4
+        zone_w = well_w / float(zone_count)
+        for z in range(zone_count):
             zx1 = pad_x + (z * zone_w)
             zx2 = zx1 + zone_w
             zb = self._canvas_kb.create_rectangle(
@@ -648,6 +758,7 @@ class PredatorMusicToolbar:
 
             self._kb_key_rects.append(k)
             self._kb_key_zones.append(zone)
+            self._kb_key_x_rels.append(x_rel)
 
         # Reset rendered cache so next tick immediately paints keys with current colors
         self._last_rendered_colors = [(-1, -1, -1), (-1, -1, -1), (-1, -1, -1), (-1, -1, -1)]
@@ -1236,6 +1347,30 @@ class PredatorMusicToolbar:
                 )
                 btn_swatch.pack(side="left", padx=2)
 
+        # Auxiliary Hardware Sync Card
+        aux_card = tk.Frame(panel, bg=self.SURFACE_CARD, highlightthickness=1, highlightbackground=self.BORDER_HAIRLINE)
+        aux_card.pack(fill="x", padx=16, pady=(6, 2))
+
+        a_row = tk.Frame(aux_card, bg=self.SURFACE_CARD)
+        a_row.pack(fill="x", padx=10, pady=6)
+
+        a_left = tk.Frame(a_row, bg=self.SURFACE_CARD)
+        a_left.pack(side="left")
+        tk.Label(a_left, text="AUXILIARY HARDWARE SYNC (REAR LIGHTBAR & PREDATOR LID LOGO)", font=(self.FONT_FAMILY, 8, "bold"), fg=self.TEXT_WHITE, bg=self.SURFACE_CARD).pack(anchor="w")
+        tk.Label(a_left, text="Synchronizes rear exhaust lightbar and chassis Predator lid emblem with musical beats", font=(self.FONT_FAMILY, 6), fg=self.TEXT_MUTED, bg=self.SURFACE_CARD).pack(anchor="w")
+
+        self._btn_aux_tab3_toggle = tk.Button(
+            a_row,
+            text="ENABLED" if self._aux_sync_enabled else "DISABLED",
+            font=(self.FONT_FAMILY, 7, "bold"),
+            bg=self.ACCENT_YELLOW if self._aux_sync_enabled else "#161616",
+            fg="#000000" if self._aux_sync_enabled else self.TEXT_MUTED,
+            bd=0, padx=10, pady=3, cursor="hand2",
+            highlightthickness=1, highlightbackground=self.ACCENT_YELLOW if self._aux_sync_enabled else self.BORDER_HAIRLINE,
+            command=self._toggle_aux_sync_gui
+        )
+        self._btn_aux_tab3_toggle.pack(side="right")
+
         # Quick Gaming Profiles at bottom of Tab 3
         qf = tk.Frame(panel, bg=self.SURFACE_PANEL)
         qf.pack(fill="x", padx=16, pady=(4, 8))
@@ -1409,6 +1544,93 @@ class PredatorMusicToolbar:
         )
         self._btn_autostart.pack(side="right")
 
+        # Power & Battery Efficiency Card
+        tk.Label(
+            col_right, text="POWER & BATTERY EFFICIENCY",
+            font=(self.FONT_FAMILY, 8, "bold"), fg=self.TEXT_SECONDARY, bg=self.SURFACE_PANEL
+        ).pack(anchor="w", padx=14, pady=(6, 4))
+
+        pwr_card = tk.Frame(col_right, bg=self.SURFACE_CARD, highlightthickness=1, highlightbackground=self.BORDER_HAIRLINE)
+        pwr_card.pack(fill="x", padx=14, pady=(0, 6))
+
+        # 1. Toggle: DISABLE APP ON BATTERY SAVER
+        t_row = tk.Frame(pwr_card, bg=self.SURFACE_CARD)
+        t_row.pack(fill="x", padx=10, pady=(6, 4))
+
+        t_left = tk.Frame(t_row, bg=self.SURFACE_CARD)
+        t_left.pack(side="left")
+        tk.Label(t_left, text="DISABLE APP ON BATTERY SAVER", font=(self.FONT_FAMILY, 8, "bold"), fg=self.TEXT_WHITE, bg=self.SURFACE_CARD).pack(anchor="w")
+        tk.Label(t_left, text="Turns off keyboard LEDs & suspends audio sampling in Battery Saver", font=(self.FONT_FAMILY, 6), fg=self.TEXT_MUTED, bg=self.SURFACE_CARD).pack(anchor="w")
+
+        pwr_btn_bg = self.ACCENT_YELLOW if self._is_battery_saver_disable else "#161616"
+        pwr_btn_fg = "#000000" if self._is_battery_saver_disable else self.TEXT_MUTED
+        self._btn_battery_saver = tk.Button(
+            t_row,
+            text="ENABLED (RECOMMENDED)" if self._is_battery_saver_disable else "DISABLED",
+            font=(self.FONT_FAMILY, 7, "bold"),
+            bg=pwr_btn_bg, fg=pwr_btn_fg,
+            bd=0, padx=10, pady=3, cursor="hand2",
+            highlightthickness=1, highlightbackground=self.ACCENT_YELLOW if self._is_battery_saver_disable else self.BORDER_HAIRLINE,
+            command=self._toggle_battery_saver_disable_gui
+        )
+        self._btn_battery_saver.pack(side="right")
+
+        # 2. Dual Power Profile Effects Dropdowns (Plugged In Effect & On Battery Effect)
+        effects_row = tk.Frame(pwr_card, bg=self.SURFACE_CARD)
+        effects_row.pack(fill="x", padx=10, pady=(2, 4))
+
+        # Left: Plugged In Effect
+        col_plugged = tk.Frame(effects_row, bg=self.SURFACE_CARD)
+        col_plugged.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        tk.Label(col_plugged, text="PLUGGED IN EFFECT:", font=(self.FONT_FAMILY, 6, "bold"), fg=self.TEXT_MUTED, bg=self.SURFACE_CARD).pack(anchor="w")
+        self._combo_plugged_effect = ttk.Combobox(
+            col_plugged,
+            values=list(ANIMATION_REGISTRY.keys()),
+            state="readonly",
+            style="Dark.TCombobox",
+            font=(self.FONT_FAMILY, 7)
+        )
+        self._combo_plugged_effect.set(self._plugged_mode if self._plugged_mode in ANIMATION_REGISTRY else "Dynamic Studio EQ")
+        self._combo_plugged_effect.pack(fill="x", pady=(2, 0))
+        self._combo_plugged_effect.bind("<<ComboboxSelected>>", self._handle_plugged_effect_select)
+
+        # Right: On Battery Effect
+        col_batt = tk.Frame(effects_row, bg=self.SURFACE_CARD)
+        col_batt.pack(side="right", fill="x", expand=True, padx=(4, 0))
+        tk.Label(col_batt, text="ON BATTERY EFFECT:", font=(self.FONT_FAMILY, 6, "bold"), fg=self.TEXT_MUTED, bg=self.SURFACE_CARD).pack(anchor="w")
+        self._combo_battery_effect = ttk.Combobox(
+            col_batt,
+            values=list(ANIMATION_REGISTRY.keys()),
+            state="readonly",
+            style="Dark.TCombobox",
+            font=(self.FONT_FAMILY, 7)
+        )
+        self._combo_battery_effect.set(self._battery_mode if self._battery_mode in ANIMATION_REGISTRY else "Static Album Art")
+        self._combo_battery_effect.pack(fill="x", pady=(2, 0))
+        self._combo_battery_effect.bind("<<ComboboxSelected>>", self._handle_battery_effect_select)
+
+        # 3. Battery Brightness Cap Slider
+        cap_row = tk.Frame(pwr_card, bg=self.SURFACE_CARD)
+        cap_row.pack(fill="x", padx=10, pady=(2, 6))
+
+        cap_header = tk.Frame(cap_row, bg=self.SURFACE_CARD)
+        cap_header.pack(fill="x")
+        tk.Label(cap_header, text="BATTERY BRIGHTNESS CAP:", font=(self.FONT_FAMILY, 6, "bold"), fg=self.TEXT_MUTED, bg=self.SURFACE_CARD).pack(side="left")
+        self._lbl_val_battery_cap = tk.Label(cap_header, text=f"{self._battery_brightness_cap}%", font=(self.FONT_MONO, 7, "bold"), fg=self.ACCENT_YELLOW, bg=self.SURFACE_CARD)
+        self._lbl_val_battery_cap.pack(side="right")
+
+        self._slider_battery_cap = tk.Scale(
+            cap_row, from_=0, to=100, orient="horizontal",
+            bg=self.SURFACE_CARD, fg=self.TEXT_WHITE, highlightthickness=0, bd=0,
+            activebackground=self.ACCENT_YELLOW, troughcolor="#181818",
+            sliderlength=14, width=8, sliderrelief="flat", showvalue=False,
+            command=self._handle_battery_cap_change
+        )
+        self._slider_battery_cap.set(self._battery_brightness_cap)
+        self._slider_battery_cap.pack(fill="x", pady=(2, 1))
+
+        tk.Label(cap_row, text="Caps keyboard LED brightness on DC battery to extend laptop battery life", font=(self.FONT_FAMILY, 6), fg=self.TEXT_MUTED, bg=self.SURFACE_CARD).pack(anchor="w")
+
     def _load_builtin_preset(self, name: str):
         if name == "Static Album Cover":
             self._select_mode("Static Album Art")
@@ -1562,6 +1784,149 @@ class PredatorMusicToolbar:
                     bg=btn_bg, fg=btn_fg,
                     highlightbackground=self.ACCENT_YELLOW if enabled else self.BORDER_HAIRLINE
                 )
+            except Exception:
+                pass
+
+    def _toggle_battery_saver_disable_gui(self):
+        new_val = not self._is_battery_saver_disable
+        self._is_battery_saver_disable = new_val
+        if self._btn_battery_saver and self.root and self.root.winfo_exists():
+            btn_bg = self.ACCENT_YELLOW if new_val else "#161616"
+            btn_fg = "#000000" if new_val else self.TEXT_MUTED
+            self._btn_battery_saver.config(
+                text="ENABLED (RECOMMENDED)" if new_val else "DISABLED",
+                bg=btn_bg, fg=btn_fg,
+                highlightbackground=self.ACCENT_YELLOW if new_val else self.BORDER_HAIRLINE
+            )
+        self.update_power_status(self._is_plugged_in, self._is_battery_saver_active, self._battery_percent)
+        if self.on_toggle_battery_saver:
+            self.on_toggle_battery_saver(new_val)
+
+    def _toggle_aux_sync_gui(self):
+        new_val = not getattr(self, "_aux_sync_enabled", True)
+        self._aux_sync_enabled = new_val
+        btn_bg = self.ACCENT_YELLOW if new_val else "#161616"
+        btn_fg = "#000000" if new_val else self.TEXT_MUTED
+
+        if hasattr(self, "_btn_aux_toggle") and self._btn_aux_toggle and self.root and self.root.winfo_exists():
+            try:
+                self._btn_aux_toggle.config(
+                    text="AUX SYNC: ON" if new_val else "AUX SYNC: OFF",
+                    bg=btn_bg, fg=btn_fg,
+                    highlightbackground=self.ACCENT_YELLOW if new_val else self.BORDER_HAIRLINE
+                )
+            except Exception:
+                pass
+
+        if hasattr(self, "_btn_tab3_aux_toggle") and self._btn_tab3_aux_toggle and self.root and self.root.winfo_exists():
+            try:
+                self._btn_tab3_aux_toggle.config(
+                    text="ENABLED" if new_val else "DISABLED",
+                    bg=btn_bg, fg=btn_fg,
+                    highlightbackground=self.ACCENT_YELLOW if new_val else self.BORDER_HAIRLINE
+                )
+            except Exception:
+                pass
+
+        if hasattr(self, "on_toggle_aux_sync") and self.on_toggle_aux_sync:
+            try:
+                self.on_toggle_aux_sync(new_val)
+            except Exception:
+                pass
+
+    def _handle_plugged_effect_select(self, event=None):
+        if self._combo_plugged_effect:
+            mode = self._combo_plugged_effect.get()
+            self._plugged_mode = mode
+            if self.on_plugged_effect_change:
+                self.on_plugged_effect_change(mode)
+
+    def _handle_battery_effect_select(self, event=None):
+        if self._combo_battery_effect:
+            mode = self._combo_battery_effect.get()
+            self._battery_mode = mode
+            if self.on_battery_effect_change:
+                self.on_battery_effect_change(mode)
+
+    def _handle_battery_cap_change(self, val):
+        cap = int(float(val))
+        self._battery_brightness_cap = cap
+        if self._lbl_val_battery_cap:
+            self._lbl_val_battery_cap.config(text=f"{cap}%")
+        if self.on_battery_brightness_cap_change:
+            self.on_battery_brightness_cap_change(cap)
+
+    def set_battery_saver_disable_state(self, enabled: bool):
+        self._is_battery_saver_disable = enabled
+        if self._btn_battery_saver and self.root and self.root.winfo_exists():
+            btn_bg = self.ACCENT_YELLOW if enabled else "#161616"
+            btn_fg = "#000000" if enabled else self.TEXT_MUTED
+            self._btn_battery_saver.config(
+                text="ENABLED (RECOMMENDED)" if enabled else "DISABLED",
+                bg=btn_bg, fg=btn_fg,
+                highlightbackground=self.ACCENT_YELLOW if enabled else self.BORDER_HAIRLINE
+            )
+        self.update_power_status(self._is_plugged_in, self._is_battery_saver_active, self._battery_percent)
+
+    def set_battery_brightness_cap(self, cap: int):
+        self._battery_brightness_cap = int(cap)
+        if self._slider_battery_cap and self.root and self.root.winfo_exists():
+            self._slider_battery_cap.set(cap)
+        if self._lbl_val_battery_cap:
+            self._lbl_val_battery_cap.config(text=f"{cap}%")
+
+    def set_power_profiles(self, plugged_mode: Optional[str] = None, battery_mode: Optional[str] = None):
+        if plugged_mode:
+            self._plugged_mode = plugged_mode
+            if self._combo_plugged_effect and self.root and self.root.winfo_exists():
+                self._combo_plugged_effect.set(plugged_mode)
+        if battery_mode:
+            self._battery_mode = battery_mode
+            if self._combo_battery_effect and self.root and self.root.winfo_exists():
+                self._combo_battery_effect.set(battery_mode)
+
+    def _toggle_aux_sync_gui(self):
+        new_val = not self._aux_sync_enabled
+        self._aux_sync_enabled = new_val
+        self.set_aux_sync_state(new_val)
+        if self.on_toggle_aux_sync:
+            self.on_toggle_aux_sync(new_val)
+
+    def set_aux_sync_state(self, enabled: bool):
+        self._aux_sync_enabled = enabled
+        if self._btn_aux_toggle and self.root and self.root.winfo_exists():
+            self._btn_aux_toggle.config(
+                text="AUX SYNC: ON" if enabled else "AUX SYNC: OFF",
+                bg=self.ACCENT_YELLOW if enabled else "#161616",
+                fg="#000000" if enabled else self.TEXT_MUTED,
+                highlightbackground=self.ACCENT_YELLOW if enabled else self.BORDER_HAIRLINE
+            )
+        if self._btn_aux_tab3_toggle and self.root and self.root.winfo_exists():
+            self._btn_aux_tab3_toggle.config(
+                text="ENABLED" if enabled else "DISABLED",
+                bg=self.ACCENT_YELLOW if enabled else "#161616",
+                fg="#000000" if enabled else self.TEXT_MUTED,
+                highlightbackground=self.ACCENT_YELLOW if enabled else self.BORDER_HAIRLINE
+            )
+        if not enabled and self._canvas_lightbar and self._lightbar_rect:
+            try:
+                self._canvas_lightbar.itemconfig(self._lightbar_rect, fill="#141414")
+            except Exception:
+                pass
+
+    def update_laptop_model(self, laptop_info: LaptopModelInfo):
+        """Dynamically updates the UI to reflect a newly detected laptop model."""
+        self.laptop_info = laptop_info
+        if self.root and self.root.winfo_exists():
+            try:
+                if self._lbl_model:
+                    self._lbl_model.config(text=f"// {laptop_info.display_name.upper()}")
+                if self._lbl_kb_matrix:
+                    self._lbl_kb_matrix.config(text=f"{laptop_info.model_name.upper()} MATRIX • {laptop_info.keyboard_type.value.upper()} • 80+ KEYS")
+                if self._lbl_aux_badge:
+                    aux_text = "REAR LIGHTBAR & LOGO //" if laptop_info.has_rear_lightbar else "AUX PERIPHERALS //"
+                    self._lbl_aux_badge.config(text=aux_text)
+                self._draw_full_keyboard()
             except Exception:
                 pass
 
@@ -1787,11 +2152,75 @@ class PredatorMusicToolbar:
         if self._is_gui_active and self.root and self.root.winfo_exists() and self.root.state() != "withdrawn":
             try:
                 self._render_gui_frame()
+                self._power_poll_tick += 1
+                if self._power_poll_tick >= 45:
+                    self._power_poll_tick = 0
+                    self._poll_system_power()
                 self._after_id = self.root.after(33, self._schedule_gui_update)
             except Exception:
                 pass
         else:
             self._after_id = None
+
+    def update_power_status(self, is_plugged, is_saver_active: bool = False, battery_pct: int = 100):
+        """Updates live power badge in header, battery saver banner, and power state."""
+        if hasattr(is_plugged, "is_plugged_in"):
+            status = is_plugged
+            is_plugged = status.is_plugged_in
+            is_saver_active = status.is_battery_saver
+            battery_pct = status.battery_percent
+
+        self._is_plugged_in = bool(is_plugged)
+        self._is_battery_saver_active = bool(is_saver_active)
+        self._battery_percent = int(battery_pct)
+
+        if not (self.root and self.root.winfo_exists()):
+            return
+
+        try:
+            # 1. Update Header Power Badge
+            if self._lbl_power_status:
+                if is_saver_active:
+                    self._lbl_power_status.config(
+                        text="🌙 BATTERY SAVER (SUSPENDED)",
+                        fg=self.ACCENT_SAVER
+                    )
+                elif not is_plugged:
+                    pct_str = f" ({battery_pct}%)" if battery_pct >= 0 else ""
+                    self._lbl_power_status.config(
+                        text=f"🔋 ON BATTERY{pct_str}",
+                        fg=self.ACCENT_AMBER
+                    )
+                else:
+                    self._lbl_power_status.config(
+                        text="⚡ PLUGGED IN",
+                        fg=self.ACCENT_GREEN
+                    )
+
+            # 2. Update Battery Saver Notification Banner
+            if self._banner_saver and self._canvas_kb:
+                if is_saver_active and self._is_battery_saver_disable:
+                    if not self._banner_saver.winfo_ismapped():
+                        self._banner_saver.pack(fill="x", padx=8, pady=(2, 2), before=self._canvas_kb)
+                else:
+                    if self._banner_saver.winfo_ismapped():
+                        self._banner_saver.pack_forget()
+        except Exception:
+            pass
+
+    def _poll_system_power(self):
+        """Zero-overhead Win32 power poll to keep badge and banner fresh even if callbacks are detached."""
+        try:
+            from ..utils.power import SYSTEM_POWER_STATUS
+            if sys.platform == "win32":
+                sps = SYSTEM_POWER_STATUS()
+                if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(sps)):
+                    plugged = sps.ACLineStatus != 0
+                    saver = sps.SystemStatusFlag == 1
+                    pct = int(sps.BatteryLifePercent) if sps.BatteryLifePercent <= 100 else 100
+                    self.update_power_status(plugged, saver, pct)
+        except Exception:
+            pass
 
     def _render_gui_frame(self):
         with self._lock:
@@ -1821,9 +2250,10 @@ class PredatorMusicToolbar:
             if self._lbl_cover:
                 if track.cover_path and os.path.exists(track.cover_path):
                     try:
-                        img = Image.open(track.cover_path).resize((56, 56), Image.Resampling.LANCZOS)
-                        self._cover_img_tk = ImageTk.PhotoImage(img)
-                        self._lbl_cover.config(image=self._cover_img_tk, text="")
+                        with Image.open(track.cover_path) as raw_img:
+                            img = raw_img.resize((56, 56), Image.Resampling.LANCZOS)
+                            self._cover_img_tk = ImageTk.PhotoImage(img)
+                            self._lbl_cover.config(image=self._cover_img_tk, text="")
                     except Exception:
                         self._lbl_cover.config(image="", text="♫")
                 else:
@@ -1853,24 +2283,71 @@ class PredatorMusicToolbar:
                         dim_hex = _dim_color(colors[z], 0.16)
                         self._canvas_kb.itemconfig(self._kb_zone_backs[z], fill=dim_hex)
 
-                # Recolor individual keycaps
+                # Recolor individual keycaps (adaptive Per-Key, 4-Zone, 3-Zone, or 1-Zone)
                 is_silent = all(sum(c) < 15 for c in colors)
+                is_per_key = self.laptop_info.is_per_key
+                total_w = 19.3
+
                 for idx in range(len(self._kb_key_rects)):
                     k_rect = self._kb_key_rects[idx]
                     z = self._kb_key_zones[idx]
                     is_wasd = k_rect in self._kb_key_wasd
                     is_arr = k_rect in self._kb_key_arrows
 
+                    # Determine target keycap color
+                    if is_per_key and idx < len(self._kb_key_x_rels):
+                        x_rel = self._kb_key_x_rels[idx]
+                        norm_x = max(0.0, min(1.0, x_rel / total_w))
+                        if norm_x < 0.333:
+                            t = norm_x / 0.333
+                            c1, c2 = colors[0], colors[1]
+                        elif norm_x < 0.666:
+                            t = (norm_x - 0.333) / 0.333
+                            c1, c2 = colors[1], colors[2]
+                        else:
+                            t = (norm_x - 0.666) / 0.334
+                            c1, c2 = colors[2], colors[3]
+                        key_c = (
+                            int(c1[0] + (c2[0] - c1[0]) * t),
+                            int(c1[1] + (c2[1] - c1[1]) * t),
+                            int(c1[2] + (c2[2] - c1[2]) * t),
+                        )
+                    elif self.laptop_info.keyboard_type == KeyboardType.THREE_ZONE_RGB and idx < len(self._kb_key_x_rels):
+                        x_rel = self._kb_key_x_rels[idx]
+                        norm_x = max(0.0, min(1.0, x_rel / total_w))
+                        z3 = 0 if norm_x < 0.33 else (1 if norm_x < 0.66 else 2)
+                        key_c = colors[z3] if z3 < len(colors) else colors[-1]
+                    elif self.laptop_info.keyboard_type == KeyboardType.ONE_ZONE_RGB:
+                        key_c = colors[1]
+                    else:
+                        key_c = colors[z]
+
                     if is_silent:
                         k_fill = "#141414" if (is_wasd or is_arr) else "#0F0F0F"
                         k_out = "#FFFFFF" if (is_wasd or is_arr) else self.BORDER_HAIRLINE
                     else:
                         factor = 0.65 if (is_wasd or is_arr) else 0.30
-                        k_fill = _dim_color(colors[z], factor)
+                        k_fill = _dim_color(key_c, factor)
                         k_out = "#FFFFFF" if (is_wasd or is_arr) else (
-                            f"#{colors[z][0]:02x}{colors[z][1]:02x}{colors[z][2]:02x}" if sum(colors[z]) > 25 else self.BORDER_HAIRLINE
+                            f"#{key_c[0]:02x}{key_c[1]:02x}{key_c[2]:02x}" if sum(key_c) > 25 else self.BORDER_HAIRLINE
                         )
                     self._canvas_kb.itemconfig(k_rect, fill=k_fill, outline=k_out)
+
+                # Recolor Auxiliary Device lightbar strip
+                if self._canvas_lightbar and self._lightbar_rect:
+                    if self._aux_sync_enabled and not is_silent:
+                        if self._aux_mode == "Sub-Bass Strobe (Zone 1)":
+                            aux_color = colors[0]
+                        elif self._aux_mode == "Beat Pulse (Zone 2)":
+                            aux_color = colors[1]
+                        elif self._aux_mode == "Album Artwork Accent":
+                            aux_color = colors[2]
+                        else:
+                            aux_color = colors[1] if sum(colors[1]) > sum(colors[0]) else colors[0]
+                        aux_hex = _dim_color(aux_color, 0.85)
+                        self._canvas_lightbar.itemconfig(self._lightbar_rect, fill=aux_hex)
+                    else:
+                        self._canvas_lightbar.itemconfig(self._lightbar_rect, fill="#141414")
 
         # 3. Update Audio Beat State, Spectrum Equalizer & Master VU Meter
         if state:

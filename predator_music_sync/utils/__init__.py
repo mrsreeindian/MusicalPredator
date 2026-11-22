@@ -2,5 +2,13 @@
 Utility modules for Predator Music Sync.
 """
 from .autostart import is_autostart_enabled, set_autostart, toggle_autostart
+from .power import PowerMonitor, PowerStatus, SYSTEM_POWER_STATUS
 
-__all__ = ["is_autostart_enabled", "set_autostart", "toggle_autostart"]
+__all__ = [
+    "is_autostart_enabled",
+    "set_autostart",
+    "toggle_autostart",
+    "PowerMonitor",
+    "PowerStatus",
+    "SYSTEM_POWER_STATUS"
+]

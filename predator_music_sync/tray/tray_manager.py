@@ -32,10 +32,11 @@ def generate_predator_tray_icon(size: int = 64) -> Image.Image:
     for candidate in asset_candidates:
         if candidate and os.path.exists(candidate):
             try:
-                loaded = Image.open(candidate).convert("RGBA")
-                if loaded.size != (size, size):
-                    loaded = loaded.resize((size, size), Image.Resampling.LANCZOS)
-                return loaded
+                with Image.open(candidate) as raw_loaded:
+                    loaded = raw_loaded.convert("RGBA")
+                    if loaded.size != (size, size):
+                        loaded = loaded.resize((size, size), Image.Resampling.LANCZOS)
+                    return loaded
             except Exception:
                 pass
 
@@ -93,6 +94,8 @@ class PredatorTrayManager:
         self._lighting_active = initial_lighting_active
         self._current_mode = initial_mode
         self._hw_status_text = hardware_status_text
+        self._power_status_text = "Plugged In"
+        self._disable_on_battery_saver = True
 
         self._icon: Optional[pystray.Icon] = None
         self._has_notified_tray = False
@@ -147,6 +150,7 @@ class PredatorTrayManager:
                 )
             ),
             Menu.SEPARATOR,
+            item(lambda it: f"Power: {self._power_status_text}", lambda icon, it: None, enabled=False),
             item(f"Hardware: {self._hw_status_text}", lambda icon, it: None, enabled=False),
             Menu.SEPARATOR,
             item("Hide to System Tray", self._handle_hide_window),
@@ -207,6 +211,25 @@ class PredatorTrayManager:
     def update_autostart_state(self):
         if self._icon:
             try:
+                self._icon.update_menu()
+            except Exception:
+                pass
+
+    def update_power_status(self, is_plugged: bool, is_saver_active: bool, battery_pct: int = 100):
+        """Updates tray icon tooltip and context menu power status line."""
+        if is_saver_active:
+            self._power_status_text = "Battery Saver (Suspended)"
+            title_text = "MusicalPredator • Battery Saver (Suspended)"
+        elif not is_plugged:
+            self._power_status_text = f"On Battery ({battery_pct}%)"
+            title_text = f"MusicalPredator • On Battery ({battery_pct}%)"
+        else:
+            self._power_status_text = "Plugged In"
+            title_text = "MusicalPredator • Plugged In"
+
+        if self._icon:
+            try:
+                self._icon.title = title_text
                 self._icon.update_menu()
             except Exception:
                 pass

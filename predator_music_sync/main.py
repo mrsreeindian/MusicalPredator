@@ -25,6 +25,8 @@ from predator_music_sync.core.media_engine import MediaTrackInfo
 from predator_music_sync.core.audio_engine import AudioBeatState
 from predator_music_sync.core.color_extractor import RGBColor
 from predator_music_sync.utils.autostart import is_autostart_enabled, set_autostart
+from predator_music_sync.utils.power import PowerStatus, PowerMonitor
+from predator_music_sync.hardware.device_detector import detect_laptop_model, LaptopModelInfo
 
 
 class PredatorMusicSyncApp:
@@ -52,6 +54,9 @@ class PredatorMusicSyncApp:
                 name = f"{dev[1]} ({dev[2]})" if len(dev) > 2 else dev[1]
                 audio_devs.append((idx, name))
 
+        # Query detected laptop hardware model
+        laptop_info = getattr(self.service, "laptop_info", None) or detect_laptop_model()
+
         # 2. Initialize GUI Desktop Toolbar
         self.gui = PredatorMusicToolbar(
             on_mode_change=self.set_animation_mode,
@@ -70,6 +75,11 @@ class PredatorMusicSyncApp:
             on_load_preset=self.service.load_preset,
             on_window_hide=self._on_window_hidden_to_tray,
             on_toggle_autostart=self.toggle_autostart,
+            on_toggle_battery_saver=self.service.set_battery_saver_disable,
+            on_plugged_effect_change=lambda mode: self.service.set_ac_profile(mode=mode),
+            on_battery_effect_change=lambda mode: self.service.set_battery_profile(mode=mode),
+            on_battery_brightness_cap_change=self.service.set_battery_brightness_cap,
+            laptop_info=laptop_info,
             controller_name=self.service.controller_name,
             is_hardware_connected=self.service.is_hw,
             audio_devices=audio_devs,
@@ -79,11 +89,16 @@ class PredatorMusicSyncApp:
             initial_brightness=self.service.controller.brightness,
             initial_sensitivity=self.service.audio_engine.sensitivity,
             initial_speed=self.service._current_speed,
-            initial_flash=self.service._current_flash
+            initial_flash=self.service._current_flash,
+            initial_battery_saver_disable=getattr(self.service, "battery_saver_disable_enabled", True),
+            initial_plugged_mode=getattr(self.service, "ac_profile", {}).get("mode", "Dynamic Studio EQ"),
+            initial_battery_mode=getattr(self.service, "battery_profile", {}).get("mode", "Static Album Art"),
+            initial_battery_brightness_cap=getattr(self.service, "battery_brightness_cap", 50)
         )
 
         # 3. Initialize Windows System Tray Icon
-        hw_status_str = f"{self.service.controller_name} [CONNECTED]" if self.service.is_hw else f"{self.service.controller_name} [EMULATION]"
+        model_title = laptop_info.display_name if laptop_info else self.service.controller_name
+        hw_status_str = f"{model_title} [CONNECTED]" if self.service.is_hw else f"{model_title} [EMULATION]"
         self.tray = PredatorTrayManager(
             on_show_window=self.restore_window,
             on_hide_window=self.hide_window,
@@ -98,6 +113,41 @@ class PredatorMusicSyncApp:
 
         # 4. Connect Service State Stream to GUI Visualizer
         self.service.add_state_listener(self._on_service_state_tick)
+        self.service.add_power_listener(self._on_power_state_changed)
+
+        # Wire Power Management callbacks to GUI
+        self.gui.on_toggle_battery_saver = self.service.set_battery_saver_disable
+        self.gui.on_battery_saver_toggle = self.service.set_battery_saver_disable
+        self.gui.on_plugged_effect_change = lambda mode: self.service.set_ac_profile(mode=mode)
+        self.gui.on_battery_effect_change = lambda mode: self.service.set_battery_profile(mode=mode)
+        self.gui.on_battery_brightness_cap_change = self.service.set_battery_brightness_cap
+        self.gui.get_power_status = self.service.get_power_status
+
+        # Push initial power state
+        init_power = self.service.get_power_status()
+        self._on_power_state_changed(init_power)
+
+    def _on_power_state_changed(self, status: PowerStatus):
+        """Dispatches power state updates to GUI badge and System Tray."""
+        if self.tray:
+            if hasattr(self.tray, 'update_power_status'):
+                self.tray.update_power_status(status.is_plugged_in, status.is_battery_saver, status.battery_percent)
+            power_desc = f" • {status.status_label}"
+            hw_status_str = f"{self.service.controller_name} [CONNECTED]{power_desc}" if self.service.is_hw else f"{self.service.controller_name} [EMULATION]{power_desc}"
+            if hasattr(self.tray, 'update_hardware_status'):
+                self.tray.update_hardware_status(hw_status_str)
+
+        if self.gui and hasattr(self.gui, 'update_power_status'):
+            if self.gui.root:
+                try:
+                    self.gui.root.after(0, lambda: self.gui.update_power_status(status))
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.gui.update_power_status(status)
+                except Exception:
+                    pass
 
     def _on_service_state_tick(self, colors: List[RGBColor], track: Optional[MediaTrackInfo], state: Optional[AudioBeatState]):
         """Transfers live 60 FPS service data to GUI buffers."""

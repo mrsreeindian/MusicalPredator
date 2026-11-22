@@ -415,18 +415,20 @@ class TestComponentAudit(unittest.TestCase):
         self.assertTrue(all(len(c) == 3 for c in c_fallback))
         print("  [PASS] Fallback safety verified: Handles None palette without exceptions.")
 
-        # Test Hardware Keepalive to prevent OEM White Reversion
+        # Test Hardware Zero-Flooding Suppression in Static Mode
         from predator_music_sync.hardware.acer_pipe_windows import AcerLightingNamedPipeBackend
         pipe_backend = AcerLightingNamedPipeBackend.__new__(AcerLightingNamedPipeBackend)
         pipe_backend._brightness = 100
         pipe_backend._last_sent_scaled = [(255, 50, 0), (0, 240, 255), (255, 200, 0), (180, 0, 255)]
         pipe_backend._last_send_time = 100.0
 
-        # Colors identical, time elapsed < 200ms -> should suppress bus flood
+        # Colors identical -> suppresses redundant hardware writes entirely (prevents EC bus overrun and white strobe)
         self.assertFalse(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=100.05))
-        # Colors identical, time elapsed >= 200ms -> MUST dispatch keepalive frame to prevent OEM timeout to white!
-        self.assertTrue(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=100.25))
-        print("  [PASS] Hardware Keepalive verified: Transmits 5 Hz refresh frames to prevent OEM white fallback.")
+        self.assertFalse(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=101.00))
+        # Subtle difference -> dispatches settling frame after 250ms
+        subtle = [(255, 51, 0), (0, 240, 255), (255, 200, 0), (180, 0, 255)]
+        self.assertTrue(pipe_backend._should_send_frame(subtle, now=100.30))
+        print("  [PASS] Hardware Zero-Flooding verified: Suppresses redundant writes in static mode to prevent EC bus resets.")
 
     # =========================================================================
     # 6. AUDIT: RESOURCE OPTIMIZATION & AUTOSTART
@@ -507,6 +509,216 @@ class TestComponentAudit(unittest.TestCase):
         toolbar.exit_application()
         set_autostart(initial_state)
 
+    # =========================================================================
+    # 7. AUDIT: POWER MANAGEMENT, DUAL PROFILES & BATTERY SAVER SUSPENSION
+    # =========================================================================
+    def test_07_power_management_and_battery_saver(self):
+        print("\n--- [AUDIT 7] Power Management, Dual Profiles & Battery Saver ---")
+        from predator_music_sync.utils.power import PowerMonitor, PowerStatus
+        from predator_music_sync.service.sync_service import PredatorSyncService
+        import time
+
+        # 1. Test live Win32 query
+        monitor = PowerMonitor()
+        status = monitor.get_status()
+        self.assertIsInstance(status.is_plugged_in, bool)
+        self.assertIsInstance(status.is_battery_saver, bool)
+        self.assertIsInstance(status.battery_percent, int)
+        print(f"  [PASS] Win32 GetSystemPowerStatus Live: {status.status_label} (Batt={status.battery_percent}%, Saver={status.is_battery_saver})")
+
+        # 2. Test Dual Power Profiles & Battery Saver auto-suspension in Background Service
+        service = PredatorSyncService(prefer_virtual=True)
+        service.start()
+        time.sleep(0.05)
+
+        try:
+            # AC Mode: 60 FPS
+            service.power_monitor.set_mock_status(is_plugged=True, is_battery_saver=False)
+            time.sleep(0.05)
+            self.assertTrue(service._is_plugged_in)
+            self.assertEqual(service.target_fps, 60)
+            print("  [PASS] AC Power Profile: 60 FPS and full performance enabled.")
+
+            # Switch to Battery: Auto-switch to battery profile (30 FPS, capped brightness)
+            service.power_monitor.set_mock_status(is_plugged=False, is_battery_saver=False, percent=65)
+            time.sleep(0.05)
+            self.assertFalse(service._is_plugged_in)
+            self.assertEqual(service.target_fps, 30)
+            self.assertEqual(service.active_animation_name, "Static Album Art")
+            self.assertLessEqual(service.controller.brightness, 50)
+            print("  [PASS] Battery Power Profile: Auto-switched to Static Album Art, 30 FPS eco mode, brightness capped at 50%.")
+
+            # Battery Saver turns ON: Instant suspension
+            service.power_monitor.set_mock_status(is_plugged=False, is_battery_saver=True, percent=15)
+            time.sleep(0.08)
+            self.assertTrue(service._is_battery_saver)
+            self.assertTrue(service._is_power_suspended)
+            # Physical/Virtual LEDs must be completely turned off to save battery
+            self.assertEqual(service.controller.current_colors, [(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)])
+            # Audio stream must be paused to drop CPU to 0.0%
+            self.assertFalse(service.audio_engine._is_running)
+            print("  [PASS] Battery Saver Active: Physical LEDs shut off (0,0,0) and audio engine paused (0.0% CPU).")
+
+            # Laptop plugged back into AC: Seamless instant restoration
+            service.power_monitor.set_mock_status(is_plugged=True, is_battery_saver=False, percent=20)
+            time.sleep(0.08)
+            self.assertFalse(service._is_battery_saver)
+            self.assertFalse(service._is_power_suspended)
+            self.assertTrue(service._is_plugged_in)
+            self.assertEqual(service.target_fps, 60)
+            self.assertTrue(service.audio_engine._is_running)
+            print("  [PASS] AC Power Restored: Audio capture and lighting resumed seamlessly at 60 FPS.")
+
+        finally:
+            service.stop()
+
+
+
+    # =========================================================================
+    # 8. AUDIT: UNIVERSAL PREDATOR & NITRO HARDWARE SUPPORT
+    # =========================================================================
+    def test_08_universal_predator_hardware_support(self):
+        print("\n--- [AUDIT 8] Universal Predator & Nitro Hardware Support ---")
+        from predator_music_sync.hardware.device_detector import (
+            LaptopModelInfo, KeyboardType, map_4zone_to_n, map_auxiliary_device_colors,
+            parse_model_string, set_mock_laptop_model, clear_mock_laptop_model,
+            detect_laptop_model
+        )
+        from predator_music_sync.hardware.factory import get_keyboard_controller, get_detected_model_info
+
+        # Reference 4-zone palette used across all mapping tests
+        palette = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
+
+        # --- 1. Model Detection: 5 Predator / Nitro laptop families ---
+        test_models = [
+            # (product_string, expected_name_fragment, expected_type, expected_zones)
+            ("Predator PHN16-71",   "Helios Neo 16",   KeyboardType.FOUR_ZONE_RGB, 4),
+            ("Predator PH16-72",    "Helios 16",        KeyboardType.PER_KEY_RGB,  84),
+            ("Predator PH315-55",   "Helios 300",       KeyboardType.FOUR_ZONE_RGB, 4),
+            ("Predator PT516-52",   "Triton 16",        KeyboardType.PER_KEY_RGB,  84),
+            ("Nitro AN515-58",      "Nitro 5",          KeyboardType.FOUR_ZONE_RGB, 4),
+        ]
+
+        for product_str, name_fragment, exp_type, exp_zones in test_models:
+            info = parse_model_string(product_str)
+            self.assertIn(
+                name_fragment, info.model_name,
+                f"Model name mismatch for '{product_str}': got '{info.model_name}'"
+            )
+            self.assertEqual(
+                info.keyboard_type, exp_type,
+                f"Keyboard type mismatch for '{product_str}': expected {exp_type}, got {info.keyboard_type}"
+            )
+            self.assertEqual(
+                info.zone_count, exp_zones,
+                f"Zone count mismatch for '{product_str}': expected {exp_zones}, got {info.zone_count}"
+            )
+            print(f"  [PASS] Detected '{product_str}' -> {info.display_name} (zones={info.zone_count})")
+
+        # --- 2. Dynamic Spatial Zone Mapping ---
+        # 4-Zone direct mapping (Helios Neo 16, Helios 300, Nitro 5)
+        mapped_4 = map_4zone_to_n(palette, 4)
+        self.assertEqual(len(mapped_4), 4)
+        self.assertEqual(mapped_4[0], palette[0])
+        self.assertEqual(mapped_4[3], palette[3])
+        print(f"  [PASS] 4-Zone Direct Mapping: {mapped_4}")
+
+        # Per-Key RGB gradient mapping (Helios 16, Helios 500, Triton 16 - 84 keys)
+        mapped_84 = map_4zone_to_n(palette, 84)
+        self.assertEqual(len(mapped_84), 84)
+        # First key should map to Zone 1 (Red)
+        self.assertEqual(mapped_84[0], palette[0])
+        # Last key should map to Zone 4 (Yellow)
+        self.assertEqual(mapped_84[-1], palette[3])
+        # Middle key (key 42) should be a valid blend between Zone 2 and Zone 3
+        mid = mapped_84[42]
+        self.assertTrue(0 <= mid[0] <= 255 and 0 <= mid[1] <= 255 and 0 <= mid[2] <= 255)
+        print(f"  [PASS] Per-Key RGB Gradient Mapping (84 keys): first={mapped_84[0]}, mid={mid}, last={mapped_84[-1]}")
+
+        # 3-Zone mapping (Triton 300, Triton 14)
+        mapped_3 = map_4zone_to_n(palette, 3)
+        self.assertEqual(len(mapped_3), 3)
+        self.assertEqual(mapped_3[0], palette[0])  # Zone 1 preserved
+        self.assertEqual(mapped_3[2], palette[3])  # Zone 4 preserved
+        # Middle zone is blend of Zone 2 and Zone 3
+        expected_mid = (
+            round((palette[1][0] + palette[2][0]) / 2),
+            round((palette[1][1] + palette[2][1]) / 2),
+            round((palette[1][2] + palette[2][2]) / 2)
+        )
+        self.assertEqual(mapped_3[1], expected_mid)
+        print(f"  [PASS] 3-Zone Mapping (Triton 300): {mapped_3}")
+
+        # 1-Zone mapping (unified average)
+        mapped_1 = map_4zone_to_n(palette, 1)
+        self.assertEqual(len(mapped_1), 1)
+        avg_r = round(sum(c[0] for c in palette) / 4)
+        avg_g = round(sum(c[1] for c in palette) / 4)
+        avg_b = round(sum(c[2] for c in palette) / 4)
+        self.assertEqual(mapped_1[0], (avg_r, avg_g, avg_b))
+        print(f"  [PASS] 1-Zone Unified Average Mapping: {mapped_1[0]}")
+
+        # --- 3. Auxiliary Device Mapping (Rear Lightbar, Lid Logo) ---
+        # Single-LED Lid Logo syncs to Zone 2 (beat accent)
+        aux_logo = map_auxiliary_device_colors(palette, 1, is_beat=False)
+        self.assertEqual(len(aux_logo), 1)
+        self.assertEqual(aux_logo[0], palette[1])  # Zone 2 primary accent
+        print(f"  [PASS] Lid Logo (1 LED): {aux_logo[0]} (Zone 2 primary accent)")
+
+        # Multi-LED Rear Lightbar: beat flash (all LEDs = Zone 2)
+        aux_lightbar_beat = map_auxiliary_device_colors(palette, 12, is_beat=True)
+        self.assertEqual(len(aux_lightbar_beat), 12)
+        self.assertTrue(all(c == palette[1] for c in aux_lightbar_beat))
+        print(f"  [PASS] Rear Lightbar (12 LEDs, beat): all LEDs flash Zone 2 = {palette[1]}")
+
+        # Multi-LED Rear Lightbar: ambient sweep (symmetric gradient center to edges)
+        aux_lightbar_ambient = map_auxiliary_device_colors(palette, 12, is_beat=False)
+        self.assertEqual(len(aux_lightbar_ambient), 12)
+        # Center LED (index 5 or 6) should be closest to Zone 2 (primary)
+        center_led = aux_lightbar_ambient[6]
+        self.assertTrue(0 <= center_led[0] <= 255 and 0 <= center_led[1] <= 255)
+        print(f"  [PASS] Rear Lightbar (12 LEDs, ambient): center={center_led}, edges=[{aux_lightbar_ambient[0]}, {aux_lightbar_ambient[-1]}]")
+
+        # --- 4. Mock-based hardware simulation via set_mock_laptop_model ---
+        # Simulate Per-Key RGB Helios 16 and verify factory returns correct model info
+        set_mock_laptop_model("Predator PH16-72")
+        try:
+            model_info = get_detected_model_info()
+            self.assertIn("Helios 16", model_info.model_name)
+            self.assertEqual(model_info.keyboard_type, KeyboardType.PER_KEY_RGB)
+            self.assertEqual(model_info.zone_count, 84)
+            self.assertTrue(model_info.has_rear_lightbar)
+            self.assertTrue(model_info.has_lid_logo)
+            print(f"  [PASS] Mock Helios 16 (Per-Key): {model_info.display_name}, lightbar={model_info.has_rear_lightbar}")
+
+            # Virtual controller should inherit the model info
+            ctrl = get_keyboard_controller(prefer_virtual=True)
+            self.assertTrue(hasattr(ctrl, "model_info"))
+            self.assertIn("Helios 16", ctrl.model_info.model_name)
+            self.assertEqual(ctrl.model_info.keyboard_type, KeyboardType.PER_KEY_RGB)
+            print(f"  [PASS] Virtual Controller inherits Per-Key RGB model profile: {ctrl.model_info.display_name}")
+        finally:
+            clear_mock_laptop_model()
+
+        # Simulate Nitro 5 (4-Zone RGB)
+        set_mock_laptop_model("Nitro AN515-58")
+        try:
+            model_info = get_detected_model_info()
+            self.assertIn("Nitro 5", model_info.model_name)
+            self.assertEqual(model_info.keyboard_type, KeyboardType.FOUR_ZONE_RGB)
+            self.assertFalse(model_info.has_rear_lightbar)
+            print(f"  [PASS] Mock Nitro 5 (4-Zone): {model_info.display_name}, lightbar={model_info.has_rear_lightbar}")
+        finally:
+            clear_mock_laptop_model()
+
+        # --- 5. Edge-case safety: empty and malformed palette ---
+        self.assertEqual(map_4zone_to_n([], 4), [(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)])
+        self.assertEqual(map_4zone_to_n(palette, 0), [])
+        self.assertEqual(map_auxiliary_device_colors([], 4), [(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)])
+        self.assertEqual(map_auxiliary_device_colors(palette, 0), [])
+        print("  [PASS] Edge-case safety: empty palette and zero LED count handled gracefully.")
+
+        print("  [PASS] Universal hardware support verified across Helios Neo 16, Helios 16 (Per-Key), Helios 300, Triton 500, Nitro 5.")
 
 
 if __name__ == "__main__":

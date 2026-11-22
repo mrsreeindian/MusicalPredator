@@ -18,8 +18,15 @@ import threading
 import time
 import math
 from ctypes import wintypes
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from .base import KeyboardControllerBase
+from .device_detector import (
+    detect_laptop_model,
+    KeyboardType,
+    LaptopModelInfo,
+    map_4zone_to_n,
+    map_auxiliary_device_colors
+)
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
@@ -66,16 +73,26 @@ INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 class AcerLightingNamedPipeBackend(KeyboardControllerBase):
     """
     Direct client for AcerLightingService_NamedPipe with zero-latency priority frame dispatch,
-    proactive beat latching, and smooth delta interpolation between hardware EC bus writes.
+    proactive beat latching, smooth delta interpolation between hardware EC bus writes,
+    and dynamic zone expansion across all Predator and Nitro laptop models.
     """
 
     PIPE_NAME = r"\\.\pipe\AcerLightingService_NamedPipe"
+
+    map_4zone_to_n = staticmethod(map_4zone_to_n)
+    map_auxiliary_device_colors = staticmethod(map_auxiliary_device_colors)
 
     def __init__(self, device_index: int = 0):
         super().__init__()
         self.device_index = device_index
         self._pipe_handle = INVALID_HANDLE_VALUE
         self._is_connected = False
+
+        # Model detection & dynamic device enumeration
+        self.model_info: LaptopModelInfo = detect_laptop_model()
+        self.devices: List[Dict[str, Any]] = []
+        self.primary_led_count: int = self.model_info.zone_count
+        self.sync_auxiliary: bool = True
 
         # Thread synchronization
         self._pipe_lock = threading.RLock()
@@ -93,14 +110,101 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         self._last_sent_scaled: List[Tuple[int, int, int]] = [(0, 0, 0)] * self.NUM_ZONES
         self._last_send_time: float = 0.0
         self._last_beat_dispatch_time: float = 0.0
+        self._last_reconnect_time: float = 0.0
 
         # Background worker
         self._worker_thread: Optional[threading.Thread] = None
         self._running = False
 
+        self.refresh_devices()
         self._init_pipe()
         if self._is_connected:
             self._start_worker()
+
+    def refresh_devices(self):
+        """Re-evaluates detected laptop model and enumerates active lighting devices."""
+        self.model_info = detect_laptop_model()
+        if self._is_connected:
+            self.devices = self._enumerate_devices()
+        else:
+            self.devices = self._fallback_devices()
+        self.primary_led_count = self.devices[0]["led_count"] if self.devices else self.model_info.zone_count
+
+    def _fallback_devices(self) -> List[Dict[str, Any]]:
+        """Constructs device profiles from model_info when pipe is offline."""
+        kb_zones = self.model_info.zone_count if self.model_info else 4
+        devs = [{
+            "index": 0,
+            "name": "Keyboard",
+            "type": "Keyboard",
+            "led_count": kb_zones,
+            "is_per_key": (kb_zones > 4)
+        }]
+        if self.model_info and self.model_info.has_rear_lightbar:
+            devs.append({
+                "index": 1,
+                "name": "Rear Lightbar",
+                "type": "Lightbar",
+                "led_count": 12,
+                "is_per_key": False
+            })
+        if self.model_info and self.model_info.has_lid_logo:
+            devs.append({
+                "index": 2,
+                "name": "Lid Logo",
+                "type": "Logo",
+                "led_count": 1,
+                "is_per_key": False
+            })
+        return devs
+
+    def _enumerate_devices(self) -> List[Dict[str, Any]]:
+        """
+        Dynamically enumerates lighting devices using Acer Lighting Service Named Pipe.
+        Command 0: get_devicecount -> returns number of lighting devices.
+        Command 1: get_deviceinfo(dev_idx) -> returns LED count, device type, and metadata.
+        """
+        cnt = self._get_device_count()
+        if cnt <= 0:
+            return self._fallback_devices()
+
+        devs = []
+        for idx in range(cnt):
+            info = self._get_device_info(idx)
+            devs.append(info)
+        return devs
+
+    def _get_device_info(self, device_index: int) -> Dict[str, Any]:
+        """
+        Queries Command 1 (get_deviceinfo) for a specific device index to extract physical LED count.
+        """
+        p0 = struct.pack('<I', device_index)
+        resp = self._send_command(1, [p0])
+        default_leds = self.model_info.zone_count if device_index == 0 else (12 if device_index == 1 else 1)
+        name = "Keyboard" if device_index == 0 else (f"Auxiliary Device {device_index}")
+
+        if resp and len(resp) >= 9:
+            try:
+                val = struct.unpack('<I', resp[5:9])[0]
+                if val > 0:
+                    led_count = val
+                elif len(resp) >= 13:
+                    val2 = struct.unpack('<I', resp[9:13])[0]
+                    led_count = val2 if val2 > 0 else default_leds
+                else:
+                    led_count = default_leds
+            except Exception:
+                led_count = default_leds
+        else:
+            led_count = default_leds
+
+        return {
+            "index": device_index,
+            "name": name,
+            "type": "Keyboard" if device_index == 0 else "Auxiliary",
+            "led_count": led_count,
+            "is_per_key": (led_count > 4 and device_index == 0)
+        }
 
     @property
     def brightness(self) -> int:
@@ -139,15 +243,21 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         with self._pipe_lock:
             if not self._init_pipe_handle():
                 self._is_connected = False
+                self.devices = self._fallback_devices()
+                self.primary_led_count = self.model_info.zone_count
                 return False
 
             cnt = self._get_device_count()
             if cnt > 0:
                 self._is_connected = True
+                self.devices = self._enumerate_devices()
+                self.primary_led_count = self.devices[0]["led_count"] if self.devices else self.model_info.zone_count
                 self.get_hardware_leds()
                 return True
             else:
                 self.close()
+                self.devices = self._fallback_devices()
+                self.primary_led_count = self.model_info.zone_count
                 return False
 
     def _handle_pipe_error(self):
@@ -172,47 +282,52 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         applies smooth delta interpolation between 120-160ms EC writes, and suppresses jitter.
         """
         while self._running:
-            # Wake on frame arrival or timeout to evaluate settling frames
-            self._frame_ready_event.wait(timeout=0.015)
-            if not self._running:
-                break
-            self._frame_ready_event.clear()
+            try:
+                # Wake on frame arrival or timeout to evaluate settling frames / keepalive
+                self._frame_ready_event.wait(timeout=0.025)
+                if not self._running:
+                    break
+                self._frame_ready_event.clear()
 
-            now = time.perf_counter()
-            target: Optional[List[Tuple[int, int, int]]] = None
-            is_beat: bool = False
+                now = time.perf_counter()
+                target: Optional[List[Tuple[int, int, int]]] = None
+                is_beat: bool = False
 
-            with self._state_lock:
-                if self._target_colors is None:
-                    continue
+                with self._state_lock:
+                    if self._target_colors is None:
+                        continue
 
-                if self._has_pending_beat and self._latched_beat_frame is not None:
-                    # Beat priority: send latched beat if not expired (>250ms)
-                    if (now - self._latched_beat_time) < 0.25:
-                        target = list(self._latched_beat_frame)
-                        is_beat = True
+                    if self._has_pending_beat and self._latched_beat_frame is not None:
+                        # Beat priority: send latched beat if not expired (>250ms)
+                        if (now - self._latched_beat_time) < 0.25:
+                            target = list(self._latched_beat_frame)
+                            is_beat = True
+                        else:
+                            target = list(self._target_colors)
+                        self._has_pending_beat = False
+                        self._latched_beat_frame = None
                     else:
                         target = list(self._target_colors)
-                    self._has_pending_beat = False
-                    self._latched_beat_frame = None
-                else:
-                    target = list(self._target_colors)
 
-            if target is None:
-                continue
+                if target is None:
+                    continue
 
-            # Smooth delta interpolation
-            frame_to_send = self._interpolate_frame(target, is_beat, now)
+                # Smooth delta interpolation
+                frame_to_send = self._interpolate_frame(target, is_beat, now)
 
-            # Check if write is necessary
-            if is_beat or self._should_send_frame(frame_to_send, now):
-                success = self._write_hardware_sync(frame_to_send)
-                if success:
-                    with self._state_lock:
-                        self._last_send_time = time.perf_counter()
-                        self._smoothed_colors = list(frame_to_send)
-                        if is_beat:
-                            self._last_beat_dispatch_time = self._last_send_time
+                # Check if write is necessary
+                if is_beat or self._should_send_frame(frame_to_send, now):
+                    success = self._write_hardware_sync(frame_to_send)
+                    if success:
+                        with self._state_lock:
+                            self._last_send_time = time.perf_counter()
+                            self._smoothed_colors = list(frame_to_send)
+                            if is_beat:
+                                self._last_beat_dispatch_time = self._last_send_time
+            except Exception:
+                # Guarantee background worker never terminates on transient OS/pipe errors
+                self._handle_pipe_error()
+                time.sleep(0.05)
 
     def _interpolate_frame(
         self,
@@ -292,10 +407,8 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         if any_diff:
             return True
 
-        # Keepalive / settling frame:
-        # Acer Lighting Service and EC firmware require regular writes (every 180ms - 250ms)
-        # to prevent background services (PredatorSense) or EC watchdogs from restoring OEM default profile (white).
-        if (now - self._last_send_time) >= 0.20:
+        # Settling frame: if subtle difference exists and no update was sent in >250ms, update hardware
+        if max_diff > 0 and (now - self._last_send_time > 0.25):
             return True
 
         return False
@@ -304,6 +417,11 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         """Atomic command write & read over the Acer Lighting Service named pipe."""
         with self._pipe_lock:
             if self._pipe_handle in (None, 0, INVALID_HANDLE_VALUE, -1):
+                now = time.perf_counter()
+                # Rate-limit pipe reconnection attempts to avoid hammering the Windows kernel
+                if (now - self._last_reconnect_time) < 1.5:
+                    return None
+                self._last_reconnect_time = now
                 if not self._init_pipe_handle():
                     return None
 
@@ -365,38 +483,57 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         with self._state_lock:
             return list(self._current_colors)
 
-    def _write_hardware_sync(self, colors: List[Tuple[int, int, int]]) -> bool:
-        """Physical write to the Acer EC pipe."""
-        scale = self._brightness / 100.0
+    def _write_device_raw(self, device_index: int, colors: List[Tuple[int, int, int]], scale: float) -> bool:
+        """Physical raw packet write to a specific lighting device over the pipe."""
         c_bytes = bytearray()
-        scaled_colors: List[Tuple[int, int, int]] = []
-
-        for i in range(self.NUM_ZONES):
-            r, g, b = colors[i]
+        for r, g, b in colors:
             r_sc = int(max(0, min(255, round(r * scale))))
             g_sc = int(max(0, min(255, round(g * scale))))
             b_sc = int(max(0, min(255, round(b * scale))))
-            scaled_colors.append((r_sc, g_sc, b_sc))
             c_bytes.extend([r_sc, g_sc, b_sc, 0])
 
-        p0 = struct.pack('<I', self.device_index)
-        p1 = struct.pack('<I', self.NUM_ZONES)
+        p0 = struct.pack('<I', device_index)
+        p1 = struct.pack('<I', len(colors))
         p2 = bytes(c_bytes)
 
         resp = self._send_command(3, [p0, p1, p2])
         if resp and len(resp) >= 9:
             status = struct.unpack('<I', resp[5:9])[0]
-            if status == 0:
-                with self._state_lock:
-                    self._last_sent_scaled = scaled_colors
-                    self._current_colors = [
-                        (int(max(0, min(255, c[0]))),
-                         int(max(0, min(255, c[1]))),
-                         int(max(0, min(255, c[2]))))
-                        for c in colors[:self.NUM_ZONES]
-                    ]
-                return True
+            return status == 0
         return False
+
+    def _write_hardware_sync(self, colors: List[Tuple[int, int, int]]) -> bool:
+        """Physical write to the Acer EC pipe with dynamic zone expansion and auxiliary sync."""
+        scale = self._brightness / 100.0
+
+        # 1. Primary Keyboard Write (dynamically expanded across physical LEDs)
+        kb_leds = self.primary_led_count
+        kb_colors = map_4zone_to_n(colors, kb_leds)
+        success = self._write_device_raw(self.device_index, kb_colors, scale)
+
+        # 2. Auxiliary Devices Sync (Rear Lightbar, Lid Logo)
+        if self.sync_auxiliary and len(self.devices) > 1:
+            for dev in self.devices[1:]:
+                dev_idx = dev.get("index", 1)
+                dev_leds = dev.get("led_count", 1)
+                is_beat = self._has_pending_beat
+                aux_colors = map_auxiliary_device_colors(colors, dev_leds, is_beat=is_beat)
+                self._write_device_raw(dev_idx, aux_colors, scale)
+
+        # Update cached colors for logical 4-zone state tracking
+        with self._state_lock:
+            self._last_sent_scaled = [
+                (int(round(c[0] * scale)), int(round(c[1] * scale)), int(round(c[2] * scale)))
+                for c in colors[:self.NUM_ZONES]
+            ]
+            self._current_colors = [
+                (int(max(0, min(255, c[0]))),
+                 int(max(0, min(255, c[1]))),
+                 int(max(0, min(255, c[2]))))
+                for c in colors[:self.NUM_ZONES]
+            ]
+
+        return success
 
     def set_zone_color(self, zone: int, r: int, g: int, b: int, sync: bool = False) -> bool:
         if not (0 <= zone < self.NUM_ZONES):

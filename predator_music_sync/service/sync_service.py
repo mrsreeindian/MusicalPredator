@@ -11,7 +11,7 @@ import time
 import json
 import ctypes
 import threading
-from typing import Optional, List, Tuple, Dict, Callable
+from typing import Optional, List, Tuple, Dict, Callable, Any
 
 from ..core.audio_engine import AudioBeatSyncEngine, AudioBeatState
 from ..core.media_engine import MediaSessionEngine, MediaTrackInfo
@@ -19,6 +19,7 @@ from ..core.color_extractor import ColorPaletteExtractor, ColorPalette, RGBColor
 from ..core.animations import ANIMATION_REGISTRY, BaseAnimation, SpectrumEqualizer
 from ..hardware.factory import get_keyboard_controller
 from ..hardware.base import KeyboardControllerBase
+from ..utils.power import PowerMonitor, PowerStatus
 
 
 class PredatorSyncService:
@@ -147,6 +148,43 @@ class PredatorSyncService:
         # Callbacks for UI updates
         self._state_listeners: List[Callable[[List[RGBColor], Optional[MediaTrackInfo], Optional[AudioBeatState]], None]] = []
 
+        # =====================================================================
+        # POWER & BATTERY SUBSYSTEM (Dual Power Profiles & Battery Saver)
+        # =====================================================================
+        self.auto_power_switching_enabled: bool = True
+        self.battery_saver_disable_enabled: bool = True
+        self.battery_brightness_cap: int = 50
+
+        # Dual power profiles
+        self.ac_profile: Dict[str, Any] = {
+            "mode": "Dynamic Studio EQ",
+            "fps": 60,
+            "brightness": 100,
+            "speed": 1.0,
+            "flash": 0.20
+        }
+        self.battery_profile: Dict[str, Any] = {
+            "mode": "Static Album Art",
+            "fps": 30,
+            "brightness": 50,
+            "speed": 0.8,
+            "flash": 0.0
+        }
+
+        self._is_power_suspended: bool = False
+        self._power_listeners: List[Callable[[PowerStatus], None]] = []
+
+        self.power_monitor = PowerMonitor(
+            poll_interval=1.5,
+            on_ac_power_change=self._on_ac_power_changed,
+            on_battery_saver_change=self._on_battery_saver_changed,
+            on_battery_percent_change=self._on_battery_percent_changed
+        )
+        init_status = self.power_monitor.get_status()
+        self._is_plugged_in: bool = init_status.is_plugged_in
+        self._is_battery_saver: bool = init_status.is_battery_saver
+        self._battery_percent: int = init_status.battery_percent
+
         self.media_engine.add_track_change_callback(self._on_track_changed)
 
     def _on_track_changed(self, track: MediaTrackInfo):
@@ -174,6 +212,7 @@ class PredatorSyncService:
 
         self.audio_engine.start()
         self.media_engine.start_monitoring()
+        self.power_monitor.start()
 
         initial_track = self.media_engine.get_current_media_track()
         if initial_track:
@@ -190,6 +229,7 @@ class PredatorSyncService:
             if threading.current_thread() != self._render_thread:
                 self._render_thread.join(timeout=0.5)
 
+        self.power_monitor.stop()
         self.audio_engine.stop()
         self.media_engine.stop_monitoring()
         try:
@@ -227,6 +267,12 @@ class PredatorSyncService:
         last_dispatched_colors: Optional[List[RGBColor]] = None
 
         while self._is_running:
+            if self._is_power_suspended:
+                # Battery Saver active: LEDs remain off, loop sleeps at 0.5s (~0.0% CPU)
+                time.sleep(0.5)
+                last_time = time.perf_counter()
+                continue
+
             t0 = time.perf_counter()
             dt = t0 - last_time
             last_time = t0
@@ -258,20 +304,17 @@ class PredatorSyncService:
             effective_is_beat = False if is_static else audio_state.is_beat
 
             # 3. Hardware dispatch:
-            # Dispatch when colors change, on musical beats (for dynamic animations),
-            # or on a 200ms keepalive timer so the hardware pipe never goes silent.
-            now = time.perf_counter()
-            should_dispatch = (not colors_unchanged) or effective_is_beat or ((now - last_dispatch_time) >= 0.20)
+            # In static modes, only dispatch once when colors or palette change (0 redundant EC writes).
+            # In dynamic modes, dispatch on color changes or audio transients.
+            should_dispatch = (not colors_unchanged) or (effective_is_beat and not is_static)
             if should_dispatch:
                 try:
                     self.controller.set_all_zones(zone_colors, is_beat=effective_is_beat)
                     last_dispatched_colors = list(zone_colors)
-                    last_dispatch_time = now
                 except TypeError:
                     try:
                         self.controller.set_all_zones(zone_colors)
                         last_dispatched_colors = list(zone_colors)
-                        last_dispatch_time = now
                     except Exception:
                         pass
                 except Exception:
@@ -407,6 +450,158 @@ class PredatorSyncService:
                     print(f"Error switching device: {e}", flush=True)
 
         threading.Thread(target=_switch, daemon=True, name="AudioDeviceSwitchWorker").start()
+
+    # =========================================================================
+    # POWER & BATTERY MANAGEMENT SUBSYSTEM
+    # =========================================================================
+    def get_power_status(self) -> PowerStatus:
+        """Returns the current Win32 power status snapshot."""
+        return self.power_monitor.get_status()
+
+    def add_power_listener(self, listener: Callable[[PowerStatus], None]):
+        """Registers a listener for live power state transitions."""
+        with self._lock:
+            if listener not in self._power_listeners:
+                self._power_listeners.append(listener)
+
+    def remove_power_listener(self, listener: Callable):
+        with self._lock:
+            if listener in self._power_listeners:
+                self._power_listeners.remove(listener)
+
+    def _notify_power_listeners(self, status: PowerStatus):
+        with self._lock:
+            listeners = list(self._power_listeners)
+        for listener in listeners:
+            try:
+                listener(status)
+            except Exception:
+                pass
+
+    def set_battery_saver_disable(self, enabled: bool):
+        """Enables or disables auto-suspension on Windows Battery Saver."""
+        with self._lock:
+            self.battery_saver_disable_enabled = bool(enabled)
+        # Re-evaluate current state
+        status = self.power_monitor.get_status()
+        self._on_battery_saver_changed(status.is_battery_saver)
+
+    def set_auto_power_switching(self, enabled: bool):
+        """Enables or disables automatic AC vs Battery profile switching."""
+        with self._lock:
+            self.auto_power_switching_enabled = bool(enabled)
+        status = self.power_monitor.get_status()
+        self._on_ac_power_changed(status.is_plugged_in)
+
+    def set_battery_brightness_cap(self, cap: int):
+        """Sets max brightness cap while on battery power."""
+        with self._lock:
+            self.battery_brightness_cap = max(0, min(100, int(cap)))
+            self.battery_profile["brightness"] = self.battery_brightness_cap
+        status = self.power_monitor.get_status()
+        if status.is_on_battery and self.auto_power_switching_enabled:
+            self.set_brightness(min(self.controller.brightness, self.battery_brightness_cap))
+
+    def set_ac_profile(self, mode: Optional[str] = None, fps: Optional[int] = None, brightness: Optional[int] = None):
+        """Configures the plugged-in AC power profile."""
+        with self._lock:
+            if mode:
+                self.ac_profile["mode"] = mode
+            if fps:
+                self.ac_profile["fps"] = max(15, min(120, int(fps)))
+            if brightness is not None:
+                self.ac_profile["brightness"] = max(0, min(100, int(brightness)))
+
+    def set_battery_profile(self, mode: Optional[str] = None, fps: Optional[int] = None, brightness: Optional[int] = None):
+        """Configures the on-battery eco power profile."""
+        with self._lock:
+            if mode:
+                self.battery_profile["mode"] = mode
+            if fps:
+                self.battery_profile["fps"] = max(15, min(60, int(fps)))
+            if brightness is not None:
+                self.battery_brightness_cap = max(0, min(100, int(brightness)))
+                self.battery_profile["brightness"] = self.battery_brightness_cap
+
+    def _on_ac_power_changed(self, is_plugged: bool):
+        """Fired when switching between AC line and Battery."""
+        with self._lock:
+            self._is_plugged_in = is_plugged
+            status = self.power_monitor.get_status()
+            auto_switch = self.auto_power_switching_enabled
+
+        if auto_switch:
+            if is_plugged:
+                # Plugged in: Restore AC profile & full 60 FPS
+                mode = self.ac_profile.get("mode", "Dynamic Studio EQ")
+                fps = self.ac_profile.get("fps", 60)
+                brightness = self.ac_profile.get("brightness", 100)
+                self.set_animation_mode(mode)
+                self.set_brightness(brightness)
+                with self._lock:
+                    self.target_fps = fps
+                    self._frame_time = 1.0 / fps
+            else:
+                # On battery: Switch to eco battery profile & 30 FPS
+                mode = self.battery_profile.get("mode", "Static Album Art")
+                fps = self.battery_profile.get("fps", 30)
+                brightness = min(self.controller.brightness, self.battery_brightness_cap)
+                self.set_animation_mode(mode)
+                self.set_brightness(brightness)
+                with self._lock:
+                    self.target_fps = fps
+                    self._frame_time = 1.0 / fps
+
+        self._notify_power_listeners(status)
+
+    def _on_battery_saver_changed(self, is_saver_active: bool):
+        """Fired when Windows Battery Saver mode toggles."""
+        with self._lock:
+            self._is_battery_saver = is_saver_active
+            status = self.power_monitor.get_status()
+            disable_on_saver = self.battery_saver_disable_enabled
+
+        if is_saver_active and disable_on_saver:
+            # Suspend lighting and audio capture completely to preserve battery
+            with self._lock:
+                self._is_power_suspended = True
+
+            # Turn off keyboard LEDs immediately
+            try:
+                if hasattr(self.controller, 'set_all_zones') and 'sync' in self.controller.set_all_zones.__code__.co_varnames:
+                    self.controller.set_all_zones([(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)], sync=True)
+                else:
+                    self.controller.set_all_zones([(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)])
+            except Exception:
+                pass
+
+            # Pause audio stream & media polling
+            self.audio_engine.stop()
+            if hasattr(self.media_engine, "pause_monitoring"):
+                self.media_engine.pause_monitoring()
+            else:
+                self.media_engine.stop_monitoring()
+        else:
+            # Exit Battery Saver: restore audio & lighting
+            was_suspended = False
+            with self._lock:
+                if self._is_power_suspended:
+                    self._is_power_suspended = False
+                    was_suspended = True
+
+            if was_suspended:
+                self.audio_engine.start()
+                if hasattr(self.media_engine, "resume_monitoring"):
+                    self.media_engine.resume_monitoring()
+                else:
+                    self.media_engine.start_monitoring()
+
+        self._notify_power_listeners(status)
+
+    def _on_battery_percent_changed(self, pct: int):
+        """Fired when battery percentage updates."""
+        status = self.power_monitor.get_status()
+        self._notify_power_listeners(status)
 
 
 # Modern Alias

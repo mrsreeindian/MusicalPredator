@@ -1,4 +1,4 @@
-"""
+r"""
 MusicalPredator - Standalone Setup Wizard
 Professional, zero-UAC user-level Windows Installer.
 Installs to %LOCALAPPDATA%\Programs\MusicalPredator, creates shortcuts,

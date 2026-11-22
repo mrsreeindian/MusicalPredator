@@ -39,6 +39,8 @@ class MediaSessionEngine:
         self._current_track: Optional[MediaTrackInfo] = None
         self._on_track_change_callbacks = []
         self._is_running = False
+        self._is_paused = False
+        self._query_lock = threading.Lock()
         self._monitor_thread: Optional[threading.Thread] = None
 
         # Preconfigure hidden startupinfo to prevent console popups on Windows
@@ -126,14 +128,51 @@ try {
             return self._query_linux_mpris()
         return None
 
+    def _cleanup_cover_cache(self, max_files: int = 50):
+        """
+        Ensures thumbnail cache doesn't accumulate unbounded temporary files.
+        Retains the newest `max_files` and cleans up old covers.
+        """
+        try:
+            if not os.path.exists(self.cache_dir):
+                return
+            files = [
+                os.path.join(self.cache_dir, f)
+                for f in os.listdir(self.cache_dir)
+                if f.startswith("cover_") and f.endswith(".jpg")
+            ]
+            if len(files) > max_files:
+                # Sort by last modified time (oldest first)
+                files.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+                current_cover = self._current_track.cover_path if self._current_track else None
+                excess = len(files) - max_files
+                deleted = 0
+                for f in files:
+                    if deleted >= excess:
+                        break
+                    if current_cover and os.path.abspath(f) == os.path.abspath(current_cover):
+                        continue
+                    try:
+                        os.remove(f)
+                        deleted += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _query_windows_smtc(self) -> Optional[MediaTrackInfo]:
+        # Lock to ensure PowerShell background processes never pile up
+        if not self._query_lock.acquire(blocking=False):
+            return self._current_track
+
+        proc = None
         try:
             cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", self._ps_script_path, self.cache_dir]
             res = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=3,
+                timeout=2.5,
                 creationflags=self._creationflags,
                 startupinfo=self._startupinfo
             )
@@ -147,9 +186,22 @@ try {
             cover_path = data.get("SavedPath", None)
             if not title and not artist:
                 return None
+            if cover_path:
+                self._cleanup_cover_cache(50)
             return MediaTrackInfo(title=title, artist=artist, album=album, cover_path=cover_path)
+        except subprocess.TimeoutExpired as te:
+            # Explicit cleanup on timeout to prevent zombie PowerShell processes
+            try:
+                if hasattr(te, 'process') and te.process:
+                    te.process.kill()
+                    te.process.communicate(timeout=0.2)
+            except Exception:
+                pass
+            return None
         except Exception:
             return None
+        finally:
+            self._query_lock.release()
 
     def _query_linux_mpris(self) -> Optional[MediaTrackInfo]:
         try:
@@ -178,15 +230,32 @@ try {
         if self._is_running:
             return
         self._is_running = True
+        self._is_paused = False
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
     def stop_monitoring(self):
         self._is_running = False
+        self._is_paused = False
+
+    def pause_monitoring(self):
+        """Suspends media polling to save CPU (e.g. during battery saver or app pause)."""
+        self._is_paused = True
+
+    def resume_monitoring(self):
+        """Resumes media polling."""
+        self._is_paused = False
+
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
 
     def _monitor_loop(self):
         last_id = None
         while self._is_running:
+            if self._is_paused:
+                time.sleep(1.0)
+                continue
             track = self.get_current_media_track()
             if track:
                 curr_id = track.track_id
