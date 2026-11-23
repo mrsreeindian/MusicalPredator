@@ -606,6 +606,9 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         g: int,
         b: int
     ) -> bool:
+        # Guard against AcerLightingService C++ bug: Direct modes (1 or 255) corrupt LightingProfile.ini and cause 0xc0000374 heap crash
+        if mode in (1, 255):
+            return True
         self.brightness = brightness
         p0 = struct.pack('<I', self.device_index)
         p1 = struct.pack('<I', mode)
