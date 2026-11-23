@@ -137,8 +137,10 @@ class PredatorSyncService:
         self.controller: KeyboardControllerBase = get_keyboard_controller(
             prefer_virtual=prefer_virtual
         )
-        self.is_hw = self.controller.is_connected and "Virtual" not in self.controller.__class__.__name__
-        self.controller_name = "Helios Neo 16 (4-Zone)" if self.is_hw else "Virtual Controller"
+        self.is_hw = "Virtual" not in self.controller.__class__.__name__
+        from ..hardware.device_detector import detect_laptop_model
+        self.laptop_info = getattr(self.controller, "model_info", None) or detect_laptop_model()
+        self.controller_name = self.laptop_info.display_name if self.is_hw else "Virtual Controller"
 
         # State cache for UI listeners
         self._latest_colors: List[RGBColor] = [(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)]
@@ -249,6 +251,11 @@ class PredatorSyncService:
                 pass
 
         print("PredatorSyncService stopped cleanly.", flush=True)
+
+    @property
+    def is_hardware_connected(self) -> bool:
+        """Returns True if the controller is connected to physical hardware."""
+        return bool(self.controller and getattr(self.controller, "is_connected", False))
 
     def add_state_listener(self, listener: Callable[[List[RGBColor], Optional[MediaTrackInfo], Optional[AudioBeatState]], None]):
         """Registers a listener callback that receives live 60 FPS engine state for GUI rendering."""

@@ -12,6 +12,8 @@ Features:
 - Thread-safe atomic pipe operations with robust 64-bit handle validation and auto-recovery.
 """
 
+import os
+import sys
 import struct
 import ctypes
 import threading
@@ -118,8 +120,8 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
 
         self.refresh_devices()
         self._init_pipe()
-        if self._is_connected:
-            self._start_worker()
+        # Always launch background worker to handle frame pacing and automatic service reconnection
+        self._start_worker()
 
     def refresh_devices(self):
         """Re-evaluates detected laptop model and enumerates active lighting devices."""
@@ -279,17 +281,28 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         """
         Ultra-responsive background transmitter.
         Samples the latest animation state on demand, handles proactive beat latching,
-        applies smooth delta interpolation between 120-160ms EC writes, and suppresses jitter.
+        applies smooth delta interpolation between 120-160ms EC writes, auto-reconnects to
+        AcerLightingService when it boots or restarts, and suppresses jitter.
         """
         while self._running:
             try:
-                # Wake on frame arrival or timeout to evaluate settling frames / keepalive
+                # Wake on frame arrival or timeout to evaluate settling frames / keepalive / auto-reconnect
                 self._frame_ready_event.wait(timeout=0.025)
                 if not self._running:
                     break
                 self._frame_ready_event.clear()
 
                 now = time.perf_counter()
+
+                # If pipe is disconnected, attempt automatic background reconnection
+                if not self._is_connected:
+                    if (now - self._last_reconnect_time) >= 1.5:
+                        self._last_reconnect_time = now
+                        if self._init_pipe():
+                            # Reconnected to hardware!
+                            pass
+                    continue
+
                 target: Optional[List[Tuple[int, int, int]]] = None
                 is_beat: bool = False
 
@@ -622,3 +635,31 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                     pass
                 self._pipe_handle = INVALID_HANDLE_VALUE
             self._is_connected = False
+
+    @staticmethod
+    def is_service_running() -> bool:
+        """Checks if AcerLightingService Windows service is currently running."""
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["sc.exe", "query", "AcerLightingService"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x08000000 if sys.platform == "win32" else 0
+            )
+            return "RUNNING" in out
+        except Exception:
+            return False
+
+    @staticmethod
+    def start_service_elevated() -> bool:
+        """Attempts to start AcerLightingService via Windows UAC elevation."""
+        try:
+            fix_bat = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Fix-AcerLightingService.bat"))
+            if os.path.exists(fix_bat):
+                ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", fix_bat, None, None, 1)
+                return ret > 32
+            ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", "/c net start AcerLightingService", None, 0)
+            return ret > 32
+        except Exception:
+            return False

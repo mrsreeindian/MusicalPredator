@@ -34,11 +34,14 @@ def get_keyboard_controller(
 
     if "windows" in system:
         # 1. Primary: Direct Named Pipe client to Acer Lighting Service (No Admin required!)
+        # On Acer Predator / Nitro laptops, ALWAYS prioritize the real physical hardware controller.
+        # Even if AcerLightingService is temporarily stopped, AcerLightingNamedPipeBackend maintains
+        # an active auto-reconnecting worker loop that links to the real keyboard the instant the service starts.
         try:
             from .acer_pipe_windows import AcerLightingNamedPipeBackend
             pipe_backend = AcerLightingNamedPipeBackend()
             pipe_backend.model_info = model_info
-            if pipe_backend.is_connected:
+            if pipe_backend.is_connected or model_info.is_predator:
                 return pipe_backend
         except Exception:
             pass
@@ -63,7 +66,7 @@ def get_keyboard_controller(
         except Exception:
             pass
 
-    # Fallback to Virtual Controller
+    # Fallback to Virtual Controller ONLY for non-Acer development/testing PCs
     vk = VirtualKeyboardBackend(on_update_callback=on_update_callback)
     vk.model_info = model_info
     return vk

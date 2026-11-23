@@ -93,6 +93,12 @@ class TestComponentAudit(unittest.TestCase):
         print("  [PASS] Concurrent thread safety: 8 worker threads mutated parameters without race conditions.")
 
         # Test Adaptive Throttling in Silence (should run at ~15 FPS)
+        orig_get_state = service.audio_engine.get_state
+        silent_state = AudioBeatState()
+        silent_state.overall_energy = 0.0
+        silent_state.is_silent = True
+        service.audio_engine.get_state = lambda: silent_state
+
         frame_times_silent = []
         def silent_listener(colors, track, state):
             frame_times_silent.append(time.perf_counter())

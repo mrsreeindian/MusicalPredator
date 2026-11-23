@@ -97,6 +97,7 @@ class PredatorMusicToolbar:
         laptop_info: Optional[LaptopModelInfo] = None,
         on_toggle_aux_sync: Optional[Callable[[bool], None]] = None,
         on_aux_mode_change: Optional[Callable[[str], None]] = None,
+        on_start_hardware_service: Optional[Callable[[], None]] = None,
         initial_aux_sync_enabled: bool = True,
         initial_aux_mode: str = "Beat Pulse (Zone 2)",
         controller_name: str = "Helios Neo 16 (4-Zone)",
@@ -138,6 +139,7 @@ class PredatorMusicToolbar:
         self.on_battery_brightness_cap_change = on_battery_brightness_cap_change
         self.on_toggle_aux_sync = on_toggle_aux_sync
         self.on_aux_mode_change = on_aux_mode_change
+        self.on_start_hardware_service = on_start_hardware_service
 
         self.controller_name = controller_name
         self.is_hardware_connected = is_hardware_connected
@@ -380,13 +382,26 @@ class PredatorMusicToolbar:
         )
         self._lbl_model.pack(side="left", padx=(6, 14))
 
-        hw_color = self.ACCENT_YELLOW if self.is_hardware_connected else self.ACCENT_WARN
-        hw_text = f"● {self.controller_name.upper()} [CONNECTED]" if self.is_hardware_connected else f"● {self.controller_name.upper()} [EMULATION]"
+        if "Virtual" in self.controller_name:
+            hw_color = self.TEXT_MUTED
+            hw_text = "● VIRTUAL CONTROLLER [EMULATION]"
+            cursor = ""
+        elif self.is_hardware_connected:
+            hw_color = self.ACCENT_YELLOW
+            hw_text = f"● {self.controller_name.upper()} [CONNECTED]"
+            cursor = ""
+        else:
+            hw_color = self.ACCENT_WARN
+            hw_text = f"⚠ {self.controller_name.upper()} [SERVICE STOPPED - CLICK TO START]"
+            cursor = "hand2"
+
         self._lbl_hw_status = tk.Label(
             left, text=hw_text,
-            font=(self.FONT_FAMILY, 7, "bold"), fg=hw_color, bg=self.SURFACE_PANEL
+            font=(self.FONT_FAMILY, 7, "bold"), fg=hw_color, bg=self.SURFACE_PANEL,
+            cursor=cursor
         )
         self._lbl_hw_status.pack(side="left")
+        self._lbl_hw_status.bind("<Button-1>", self._trigger_start_hardware_service)
 
         # Live Power & Battery Status Badge
         self._lbl_power_status = tk.Label(
@@ -2132,6 +2147,38 @@ class PredatorMusicToolbar:
                 pass
         if notify and self.on_toggle_lighting:
             self.on_toggle_lighting(active)
+
+    def update_hardware_connection(self, is_connected: bool):
+        """Dynamically updates the header hardware status badge when connection state changes."""
+        self.is_hardware_connected = is_connected
+        if not hasattr(self, '_lbl_hw_status') or not self._lbl_hw_status:
+            return
+        if "Virtual" in self.controller_name:
+            hw_color = self.TEXT_MUTED
+            hw_text = "● VIRTUAL CONTROLLER [EMULATION]"
+            self._lbl_hw_status.config(cursor="")
+        elif is_connected:
+            hw_color = self.ACCENT_YELLOW
+            hw_text = f"● {self.controller_name.upper()} [CONNECTED]"
+            self._lbl_hw_status.config(cursor="")
+        else:
+            hw_color = self.ACCENT_WARN
+            hw_text = f"⚠ {self.controller_name.upper()} [SERVICE STOPPED - CLICK TO START]"
+            self._lbl_hw_status.config(cursor="hand2")
+        self._lbl_hw_status.config(text=hw_text, fg=hw_color)
+
+    def _trigger_start_hardware_service(self, event=None):
+        """Triggers service start helper when user clicks the service stopped warning badge."""
+        if self.is_hardware_connected:
+            return
+        if self.on_start_hardware_service:
+            self.on_start_hardware_service()
+        else:
+            try:
+                from ..hardware.acer_pipe_windows import AcerLightingNamedPipeBackend
+                AcerLightingNamedPipeBackend.start_service_elevated()
+            except Exception:
+                pass
 
     # =========================================================================
     # REAL-TIME 60 FPS RENDER LOOP & GUI TICK

@@ -81,7 +81,8 @@ class PredatorMusicSyncApp:
             on_battery_brightness_cap_change=self.service.set_battery_brightness_cap,
             laptop_info=laptop_info,
             controller_name=self.service.controller_name,
-            is_hardware_connected=self.service.is_hw,
+            is_hardware_connected=self.service.is_hardware_connected,
+            on_start_hardware_service=self.start_hardware_service,
             audio_devices=audio_devs,
             selected_device_index=self.service.audio_engine.device_index,
             initial_mode=self.service.active_animation_name,
@@ -149,6 +150,14 @@ class PredatorMusicSyncApp:
                 except Exception:
                     pass
 
+    def start_hardware_service(self):
+        """Attempts to start AcerLightingService via Windows UAC elevation."""
+        try:
+            from predator_music_sync.hardware.acer_pipe_windows import AcerLightingNamedPipeBackend
+            return AcerLightingNamedPipeBackend.start_service_elevated()
+        except Exception:
+            return False
+
     def _on_service_state_tick(self, colors: List[RGBColor], track: Optional[MediaTrackInfo], state: Optional[AudioBeatState]):
         """Transfers live 60 FPS service data to GUI buffers."""
         if self.gui:
@@ -157,6 +166,14 @@ class PredatorMusicSyncApp:
                 self.gui.update_track_info(track)
             if state:
                 self.gui.update_audio_state(state)
+            if hasattr(self.service, "is_hardware_connected") and hasattr(self.gui, "update_hardware_connection"):
+                is_conn = self.service.is_hardware_connected
+                if is_conn != getattr(self.gui, "is_hardware_connected", None):
+                    if self.gui.root:
+                        try:
+                            self.gui.root.after(0, lambda: self.gui.update_hardware_connection(is_conn))
+                        except Exception:
+                            pass
 
     def _on_window_hidden_to_tray(self):
         """Called when user closes the window with the 'X' button or 'Hide to Tray' button."""
