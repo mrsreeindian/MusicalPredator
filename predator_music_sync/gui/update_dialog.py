@@ -12,6 +12,7 @@ Provides:
 from __future__ import annotations
 
 import os
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -64,7 +65,11 @@ class UpdateDialog:
         self.win: Optional[tk.Toplevel] = None
         self._is_checking = False
         self._is_downloading = False
+        self._is_closing = False
         self._cancel_event: Optional[threading.Event] = None
+        self._main_thread_id = threading.get_ident()
+        self._ui_queue: queue.Queue = queue.Queue(maxsize=256)
+        self._ui_pump_id: Optional[str] = None
 
         # Widgets
         self._lbl_status: Optional[tk.Label] = None
@@ -111,7 +116,10 @@ class UpdateDialog:
         except Exception:
             pass
 
+        self._is_closing = False
+        self._main_thread_id = threading.get_ident()
         self._build_ui()
+        self._start_ui_queue_pump()
 
         if self._result is not None:
             self._apply_check_result(self._result)
@@ -289,12 +297,65 @@ class UpdateDialog:
         )
         self._btn_primary.pack(side="right")
 
-    def _safe_ui(self, fn) -> None:
-        if self.win and self.win.winfo_exists():
+    def _safe_ui(self, fn: Callable[[], None]) -> None:
+        """Queues UI updates from worker threads onto the Tkinter main-thread pump without cross-thread Tcl calls."""
+        if self._is_closing:
+            return
+        if threading.get_ident() == self._main_thread_id:
+            if self.win and self.win.winfo_exists():
+                try:
+                    fn()
+                except Exception:
+                    pass
+            return
+        try:
+            self._ui_queue.put_nowait(fn)
+        except queue.Full:
             try:
-                self.win.after(0, fn)
+                self._ui_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._ui_queue.put_nowait(fn)
+            except queue.Full:
+                pass
+
+    def _start_ui_queue_pump(self) -> None:
+        if self._is_closing or not self.win:
+            return
+        self._drain_ui_queue()
+
+    def _drain_ui_queue(self) -> None:
+        if self._is_closing or not self.win:
+            self._ui_pump_id = None
+            return
+        try:
+            if not self.win.winfo_exists():
+                self._ui_pump_id = None
+                return
+        except Exception:
+            self._ui_pump_id = None
+            return
+
+        for _ in range(32):
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
             except Exception:
                 pass
+            if self._is_closing or not self.win:
+                self._ui_pump_id = None
+                return
+
+        if not self._is_closing and self.win:
+            try:
+                if self.win.winfo_exists():
+                    self._ui_pump_id = self.win.after(33, self._drain_ui_queue)
+            except Exception:
+                self._ui_pump_id = None
 
     def _set_notes_text(self, text: str) -> None:
         if not self._txt_notes:
@@ -543,8 +604,16 @@ class UpdateDialog:
         open_release_page(url, repo=self.manager.repo)
 
     def _on_close(self) -> None:
+        self._is_closing = True
         if self._is_downloading and self._cancel_event:
             self._cancel_event.set()
+        if self._ui_pump_id and self.win:
+            try:
+                if self.win.winfo_exists():
+                    self.win.after_cancel(self._ui_pump_id)
+            except Exception:
+                pass
+            self._ui_pump_id = None
         if self.win and self.win.winfo_exists():
             try:
                 self.win.destroy()

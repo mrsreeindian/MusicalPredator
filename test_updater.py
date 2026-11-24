@@ -15,9 +15,11 @@ import http.server
 import json
 import os
 import socketserver
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import unittest
 
@@ -202,6 +204,43 @@ class TestRuntimeModeAndScripts(unittest.TestCase):
         self.assertIn("9876", installed_cmd)
         self.assertIn("--silent --dir=", installed_cmd)
         self.assertIn("--launch", installed_cmd)
+        self.assertIn('find """%PID_WAIT%"""', portable_cmd)
+        self.assertIn('find """%PID_WAIT%"""', installed_cmd)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows cmd/tasklist integration test")
+    def test_windows_cmd_pid_wait_check_live_and_dead_pid(self):
+        script_text = build_portable_update_script(
+            pid=os.getpid(),
+            downloaded_exe=r"C:\Temp\new.exe",
+            target_exe=r"C:\Temp\app.exe",
+            staging_dir=r"C:\Temp\stage",
+        )
+        find_line = next(
+            line.strip() for line in script_text.splitlines() if "tasklist /FI" in line
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            probe_cmd = os.path.join(tmp, "probe_pid.cmd")
+            with open(probe_cmd, "w", encoding="utf-8") as f:
+                f.write("@echo off\n")
+                f.write('set "PID_WAIT=%~1"\n')
+                f.write(f"{find_line}\n")
+                f.write("exit /b %errorlevel%\n")
+
+            live_res = subprocess.run(
+                ["cmd.exe", "/c", probe_cmd, str(os.getpid())],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(live_res.returncode, 0, f"Live PID check failed: {live_res.stderr}")
+            self.assertEqual(live_res.stderr.strip(), "")
+
+            dead_res = subprocess.run(
+                ["cmd.exe", "/c", probe_cmd, "9999999"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(dead_res.returncode, 1, f"Dead PID check failed: {dead_res.stderr}")
+            self.assertEqual(dead_res.stderr.strip(), "")
 
     def test_setup_gui_version_and_cli_flags(self):
         self.assertEqual(setup_gui.APP_VERSION, PKG_VERSION)
@@ -400,6 +439,27 @@ class TestUpdateDialogUI(unittest.TestCase):
                 self.assertIsNotNone(dlg.win)
                 self.assertIn("1.1.0", dlg._lbl_status.cget("text"))
                 self.assertIn("1.1.0", dlg._lbl_versions.cget("text"))
+
+                # Verify _safe_ui from a worker thread queues onto the main-thread pump without direct Tcl calls
+                ran_on_thread = []
+                done_evt = threading.Event()
+
+                def _bg():
+                    dlg._safe_ui(lambda: [ran_on_thread.append(threading.get_ident()), done_evt.set()])
+
+                t = threading.Thread(target=_bg)
+                t.start()
+                t.join(timeout=2.0)
+                self.assertEqual(len(ran_on_thread), 0, "Callback must not run on background thread")
+
+                for _ in range(25):
+                    root.update()
+                    if done_evt.is_set():
+                        break
+                    time.sleep(0.02)
+                self.assertTrue(done_evt.is_set())
+                self.assertEqual(ran_on_thread, [dlg._main_thread_id])
+
                 dlg._on_close()
         finally:
             root.destroy()

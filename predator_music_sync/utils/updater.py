@@ -585,6 +585,17 @@ def _escape_cmd_arg(value: str) -> str:
     return value.replace('"', '""')
 
 
+def _build_pid_wait_loop(goto_label: str) -> str:
+    """Returns a Windows batch loop waiting until %PID_WAIT% exits (exact CSV PID match)."""
+    return (
+        "for /L %%i in (1,1,30) do (\n"
+        '    tasklist /FI "PID eq %PID_WAIT%" /FO CSV /NH 2>nul | find """%PID_WAIT%""" >nul\n'
+        f"    if errorlevel 1 goto :{goto_label}\n"
+        "    ping -n 2 127.0.0.1 >nul\n"
+        ")"
+    )
+
+
 def build_portable_update_script(
     pid: int,
     downloaded_exe: str,
@@ -596,6 +607,7 @@ def build_portable_update_script(
     target_dir = os.path.dirname(os.path.abspath(target_exe))
     backup_exe = f"{target_exe}.bak"
     launch_args = " --minimized" if relaunch_minimized else ""
+    wait_loop = _build_pid_wait_loop("do_swap")
 
     return f"""@echo off
 setlocal enabledelayedexpansion
@@ -606,11 +618,7 @@ set "TARGET_DIR={_escape_cmd_arg(target_dir)}"
 set "BACKUP_EXE={_escape_cmd_arg(backup_exe)}"
 set "STAGING_DIR={_escape_cmd_arg(os.path.abspath(staging_dir))}"
 
-for /L %%i in (1,1,30) do (
-    tasklist /FI "PID eq %PID_WAIT%" /FO CSV /NH 2>nul | find "\\"%PID_WAIT%\\"" >nul
-    if errorlevel 1 goto :do_swap
-    ping -n 2 127.0.0.1 >nul
-)
+{wait_loop}
 
 :do_swap
 ping -n 2 127.0.0.1 >nul
@@ -652,6 +660,7 @@ def build_installed_update_script(
 ) -> str:
     """Builds a detached Windows batch script that runs MusicalPredator-Setup.exe silently after PID exits."""
     min_flag = " --minimized" if relaunch_minimized else ""
+    wait_loop = _build_pid_wait_loop("run_setup")
     return f"""@echo off
 setlocal enabledelayedexpansion
 set "PID_WAIT={int(pid)}"
@@ -659,11 +668,7 @@ set "SETUP_EXE={_escape_cmd_arg(os.path.abspath(downloaded_setup))}"
 set "INSTALL_DIR={_escape_cmd_arg(os.path.abspath(install_dir))}"
 set "STAGING_DIR={_escape_cmd_arg(os.path.abspath(staging_dir))}"
 
-for /L %%i in (1,1,30) do (
-    tasklist /FI "PID eq %PID_WAIT%" /FO CSV /NH 2>nul | find "\\"%PID_WAIT%\\"" >nul
-    if errorlevel 1 goto :run_setup
-    ping -n 2 127.0.0.1 >nul
-)
+{wait_loop}
 
 :run_setup
 ping -n 2 127.0.0.1 >nul
