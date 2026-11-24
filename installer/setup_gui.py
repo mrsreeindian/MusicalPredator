@@ -135,15 +135,19 @@ def _create_shortcut(shortcut_name: str, folder: str, target: str, work_dir: str
     """Creates a Windows .lnk shortcut using temporary VBScript execution."""
     os.makedirs(folder, exist_ok=True)
     lnk_path = os.path.join(folder, shortcut_name)
-    vbs_script = f"""
-Set WshShell = CreateObject("WScript.Shell")
-Set oShortcut = WshShell.CreateShortcut("{lnk_path.replace('\\', '\\\\')}")
-oShortcut.TargetPath = "{target.replace('\\', '\\\\')}"
-oShortcut.WorkingDirectory = "{work_dir.replace('\\', '\\\\')}"
-oShortcut.Description = "{desc}"
-"""
+    lnk_esc = lnk_path.replace("\\", "\\\\")
+    target_esc = target.replace("\\", "\\\\")
+    work_esc = work_dir.replace("\\", "\\\\")
+    vbs_script = (
+        '\nSet WshShell = CreateObject("WScript.Shell")\n'
+        f'Set oShortcut = WshShell.CreateShortcut("{lnk_esc}")\n'
+        f'oShortcut.TargetPath = "{target_esc}"\n'
+        f'oShortcut.WorkingDirectory = "{work_esc}"\n'
+        f'oShortcut.Description = "{desc}"\n'
+    )
     if icon:
-        vbs_script += f'oShortcut.IconLocation = "{icon.replace("\\", "\\\\")}"\n'
+        icon_esc = icon.replace("\\", "\\\\")
+        vbs_script += f'oShortcut.IconLocation = "{icon_esc}"\n'
     vbs_script += "oShortcut.Save\n"
 
     subprocess.run(["cscript", "//nologo", "/E:VBScript"], input=vbs_script, text=True, capture_output=True)

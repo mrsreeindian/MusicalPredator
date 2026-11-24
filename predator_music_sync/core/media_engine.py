@@ -372,7 +372,7 @@ while (($targetDir = [Console]::In.ReadLine()) -ne $null) {
                     break
             self._ps_proc.stdin.write(self.cache_dir + "\n")
             self._ps_proc.stdin.flush()
-            timeout = 4.0 if self._ps_query_count == 0 else 2.5
+            timeout = 8.0 if self._ps_query_count == 0 else 3.0
             self._ps_query_count += 1
             line = self._ps_stdout_queue.get(timeout=timeout)
             if line is None:
