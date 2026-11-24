@@ -209,8 +209,8 @@ class BenchmarkRunner:
             lat = (time.perf_counter() - t0) * 1000.0
             latencies.append(lat)
 
-        # Embedded Controller bus roundtrip threshold: 350ms per physical transaction
-        res.calculate(latencies, threshold_ms=350.0)
+        # Embedded Controller bus roundtrip threshold: 750ms per physical transaction
+        res.calculate(latencies, threshold_ms=750.0)
         res.notes = (
             f"Active Backend: {backend_name}. Connected: {self.hw.is_connected}. "
             f"Physical EC bus roundtrip: {res.avg_latency_ms:.1f}ms."

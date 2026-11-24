@@ -18,24 +18,26 @@ from .color_extractor import ColorPalette, RGBColor, ColorPaletteExtractor
 from .audio_engine import AudioBeatState
 
 def _blend_white(color: RGBColor, factor: float, intensity: float = 1.0) -> RGBColor:
-    """Overdrive color towards white-hot peak based on user flash intensity (0.0 = no flash, 1.0 = full)."""
-    f = max(0.0, min(1.0, factor * intensity))
+    """Overdrive color towards bright peak while preserving core hue saturation on physical RGB LEDs."""
+    f = max(0.0, min(1.0, factor * intensity * 0.65))
     if f <= 0.001:
         return color
     return (
-        int(min(255, color[0] + (255 - color[0]) * f)),
-        int(min(255, color[1] + (255 - color[1]) * f)),
-        int(min(255, color[2] + (255 - color[2]) * f))
+        int(min(255, round(color[0] + (255 - color[0]) * f))),
+        int(min(255, round(color[1] + (255 - color[1]) * f))),
+        int(min(255, round(color[2] + (255 - color[2]) * f)))
     )
 
 def _scale_color(color: RGBColor, factor: float) -> RGBColor:
-    f = max(0.0, factor)
+    f = max(0.0, min(1.5, factor))
     if f == 1.0:
         return color
+    # Perceptual gamma expansion (~0.85): prevents lower audio levels from dropping into muddy darkness
+    f_eff = f if f >= 1.0 else (f ** 0.85)
     return (
-        int(min(255, max(0, color[0] * f))),
-        int(min(255, max(0, color[1] * f))),
-        int(min(255, max(0, color[2] * f)))
+        int(min(255, max(0, round(color[0] * f_eff)))),
+        int(min(255, max(0, round(color[1] * f_eff)))),
+        int(min(255, max(0, round(color[2] * f_eff))))
     )
 
 def _lerp_color(c1: RGBColor, c2: RGBColor, t: float) -> RGBColor:
@@ -96,18 +98,18 @@ class SpectrumEqualizer(BaseAnimation):
             return [_scale_color(base_colors[i], self._levels[i]) for i in range(4)]
 
         bands = audio_state.smoothed_bands
-        # Sharp exponential contrast E^2.2: noise stays off, loud transients slam
+        # Musical perceptual power curve (E^1.35): provides punchy dynamics without crushing normal audio into darkness
         punch_bands = [
-            (float(bands[0]) ** 2.2) if len(bands) > 0 else 0.0,
-            (float(bands[1]) ** 2.2) if len(bands) > 1 else 0.0,
-            (float(bands[2]) ** 2.2) if len(bands) > 2 else 0.0,
-            (float(bands[3]) ** 2.2) if len(bands) > 3 else 0.0,
+            (float(bands[0]) ** 1.35) if len(bands) > 0 else 0.0,
+            (float(bands[1]) ** 1.35) if len(bands) > 1 else 0.0,
+            (float(bands[2]) ** 1.35) if len(bands) > 2 else 0.0,
+            (float(bands[3]) ** 1.35) if len(bands) > 3 else 0.0,
         ]
 
         # Bass kick transient punch on Zone 1 (WASD) and Zone 2
         if audio_state.is_beat:
-            punch_bands[0] = max(punch_bands[0], 0.90 + audio_state.beat_strength * 0.45)
-            punch_bands[1] = max(punch_bands[1], 0.75 + audio_state.beat_strength * 0.35)
+            punch_bands[0] = max(punch_bands[0], 0.95 + audio_state.beat_strength * 0.35)
+            punch_bands[1] = max(punch_bands[1], 0.85 + audio_state.beat_strength * 0.30)
 
         base_colors = [palette.zone1, palette.zone2, palette.zone3, palette.zone4]
         result: List[RGBColor] = []
@@ -134,14 +136,16 @@ class SpectrumEqualizer(BaseAnimation):
 
             # Peak hold needle glint
             if pk > lvl + 0.15 and pk > 0.35:
-                glint = min(0.40, (pk - lvl) * 0.7)
-                c = _blend_white(c, glint, 0.8)
+                glint = min(0.35, (pk - lvl) * 0.6)
+                c = _blend_white(c, glint, 0.7)
 
-            # White flash overdrive on high volume peaks
-            if lvl > 0.75 and self.flash_intensity > 0.05:
-                c = _blend_white(c, (lvl - 0.75) * 0.8, self.flash_intensity)
+            # High volume transient saturation overdrive
+            if lvl > 0.80 and self.flash_intensity > 0.05:
+                c = _blend_white(c, (lvl - 0.80) * 0.7, self.flash_intensity)
 
-            result.append(_scale_color(c, min(1.35, lvl * 1.30)))
+            # Active playback underglow floor (0.18): keeps keyboard richly illuminated with album art colors
+            active_lvl = min(1.35, max(0.18, lvl * 1.25))
+            result.append(_scale_color(c, active_lvl))
 
         return result
 

@@ -369,6 +369,25 @@ class TestComponentAudit(unittest.TestCase):
             self.assertEqual(len(interpolated[z]), 3)
         print("  [PASS] Smooth delta interpolation computed valid 4-zone RGB transitions.")
 
+        # 5. Device enumeration and LED count validation
+        if hw.is_connected:
+            print(f"  [INFO] Hardware devices enumerated: {hw.devices}")
+            self.assertEqual(hw.primary_led_count, 4, "Expected 4-zone keyboard to have primary_led_count = 4")
+            for dev in hw.devices:
+                self.assertLessEqual(dev.get("led_count", 0), 128, f"Device LED count exceeded sanity limit: {dev}")
+
+            # 6. Physical synchronous hardware frame dispatch over named pipe
+            test_frames = [
+                [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)],
+                [(0, 255, 255), (255, 0, 255), (255, 255, 0), (0, 255, 0)],
+                [(255, 255, 255)] * 4
+            ]
+            for idx, frame in enumerate(test_frames):
+                ok = hw._write_hardware_sync(frame)
+                self.assertTrue(ok, f"Frame {idx} write_hardware_sync failed")
+                self.assertTrue(hw.is_connected, f"Frame {idx} resulted in pipe disconnection")
+            print("  [PASS] Physical hardware frame dispatch verified across named pipe (100% stable).")
+
         hw.close()
         print("  [PASS] Hardware Layer closed cleanly.")
 
@@ -428,13 +447,57 @@ class TestComponentAudit(unittest.TestCase):
         pipe_backend._last_sent_scaled = [(255, 50, 0), (0, 240, 255), (255, 200, 0), (180, 0, 255)]
         pipe_backend._last_send_time = 100.0
 
-        # Colors identical -> suppresses redundant hardware writes entirely (prevents EC bus overrun and white strobe)
+        # Fast identical frame -> suppresses redundant fast writes (prevents EC bus overrun)
         self.assertFalse(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=100.05))
-        self.assertFalse(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=101.00))
+        # Hardware Watchdog Keep-Alive -> dispatches refresh at >=0.45s to prevent Acer EC firmware from reverting to white
+        self.assertTrue(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=100.55))
         # Subtle difference -> dispatches settling frame after 250ms
         subtle = [(255, 51, 0), (0, 240, 255), (255, 200, 0), (180, 0, 255)]
         self.assertTrue(pipe_backend._should_send_frame(subtle, now=100.30))
-        print("  [PASS] Hardware Zero-Flooding verified: Suppresses redundant writes in static mode to prevent EC bus resets.")
+        # Static Mode Verification -> suppresses ALL redundant keep-alive writes so physical LEDs never blink
+        pipe_backend._is_static_mode = True
+        self.assertFalse(pipe_backend._should_send_frame(pipe_backend._last_sent_scaled, now=100.55))
+        self.assertTrue(pipe_backend._should_send_frame([(0, 0, 0)] * 4, now=100.05))
+        print("  [PASS] Hardware Keep-Alive verified: Suppresses redundant writes while zero-flicker static mode eliminates blinking.")
+
+        # Test Seamless Track Transition Palette Retention
+        from predator_music_sync.service.sync_service import PredatorSyncService
+        from predator_music_sync.core.media_engine import MediaTrackInfo
+        service = PredatorSyncService.__new__(PredatorSyncService)
+        service._lock = threading.Lock()
+        service._latest_track = None
+        service._manual_theme_name = "Auto (Album Cover)"
+        service.color_extractor = ColorPaletteExtractor()
+        service.current_palette = custom_palette
+
+        # Transition 1: Next song starts, cover not downloaded yet (cover_path is None)
+        t_loading = MediaTrackInfo(title="Song 2", artist="Artist 2", cover_path=None)
+        service._on_track_changed(t_loading)
+        self.assertEqual(service.current_palette, custom_palette, "Must retain previous palette while new song cover is loading!")
+        print("  [PASS] Seamless palette retention: Holds previous active palette during cover loading transition.")
+
+        # Transition 2: Cover arrives on disk
+        import tempfile
+        from PIL import Image
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        img = Image.new("RGB", (64, 64), color=(255, 100, 0))
+        img.save(tmp_path, "JPEG")
+        try:
+            t_ready = MediaTrackInfo(title="Song 2", artist="Artist 2", cover_path=tmp_path)
+            service._on_track_changed(t_ready)
+            self.assertNotEqual(service.current_palette, custom_palette, "Must update directly to new song palette when cover is ready!")
+            p_song2 = service.current_palette
+            print("  [PASS] Direct palette update: Seamlessly applies new cover palette upon arrival.")
+
+            # Transition 3: Track with no cover at all retains song 2 palette
+            t_no_cover = MediaTrackInfo(title="Song 3 No Cover", artist="Artist 3", cover_path=None)
+            service._on_track_changed(t_no_cover)
+            self.assertEqual(service.current_palette, p_song2, "Must retain valid palette if track has no artwork.")
+            print("  [PASS] Missing artwork retention: Safely retains previous valid palette without reverting to white.")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     # =========================================================================
     # 6. AUDIT: RESOURCE OPTIMIZATION & AUTOSTART

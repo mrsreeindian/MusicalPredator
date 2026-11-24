@@ -77,6 +77,8 @@ def build():
         "--hidden-import=predator_music_sync.utils.autostart",
         "--hidden-import=predator_music_sync.utils.power",
         "--hidden-import=predator_music_sync.hardware.device_detector",
+        "--hidden-import=materialyoucolor",
+        "--collect-all=materialyoucolor",
         "--collect-all=sounddevice",
         "--collect-all=_sounddevice_data",
         "--collect-all=pystray",

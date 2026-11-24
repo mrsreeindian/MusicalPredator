@@ -22,7 +22,8 @@ class MediaTrackInfo:
 
     @property
     def track_id(self) -> str:
-        s = f"{self.title}|{self.artist}|{self.album}"
+        has_cover = bool(self.cover_path and os.path.exists(self.cover_path))
+        s = f"{self.title}|{self.artist}|{self.album}|{has_cover}"
         return hashlib.md5(s.encode("utf-8")).hexdigest()
 
     def __repr__(self):
@@ -259,7 +260,12 @@ try {
             track = self.get_current_media_track()
             if track:
                 curr_id = track.track_id
-                if curr_id != last_id:
+                cover_just_arrived = (
+                    self._current_track is not None
+                    and not self._current_track.cover_path
+                    and bool(track.cover_path and os.path.exists(track.cover_path))
+                )
+                if curr_id != last_id or cover_just_arrived:
                     last_id = curr_id
                     self._current_track = track
                     for cb in self._on_track_change_callbacks:

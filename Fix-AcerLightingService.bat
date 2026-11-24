@@ -20,7 +20,8 @@ if %errorlevel% neq 0 (
 echo [*] Administrator privileges confirmed.
 echo.
 
-echo [1/4] Terminating any crashed or hanging service instances...
+echo [1/4] Terminating any crashed or hanging service and app instances...
+taskkill /F /IM MusicalPredator.exe >nul 2>&1
 taskkill /F /IM AcerLightingService.exe >nul 2>&1
 net stop AcerLightingService >nul 2>&1
 timeout /t 1 /nobreak >nul

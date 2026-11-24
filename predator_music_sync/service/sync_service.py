@@ -193,10 +193,12 @@ class PredatorSyncService:
         with self._lock:
             self._latest_track = track
             if self._manual_theme_name is None or self._manual_theme_name == "Auto (Album Cover)":
-                if track and track.cover_path and os.path.exists(track.cover_path):
+                if track and track.cover_path and os.path.exists(track.cover_path) and os.path.getsize(track.cover_path) > 0:
                     new_palette = self.color_extractor.extract_from_image_path(track.cover_path)
-                    self.current_palette = new_palette
-                else:
+                    if new_palette:
+                        self.current_palette = new_palette
+                elif self.current_palette is None:
+                    # Only fallback on cold start before any palette exists
                     self.current_palette = ColorPaletteExtractor.DEFAULT_PALETTES[0]
 
     def start(self):
@@ -311,17 +313,32 @@ class PredatorSyncService:
             effective_is_beat = False if is_static else audio_state.is_beat
 
             # 3. Hardware dispatch:
-            # In static modes, only dispatch once when colors or palette change (0 redundant EC writes).
-            # In dynamic modes, dispatch on color changes or audio transients.
-            should_dispatch = (not colors_unchanged) or (effective_is_beat and not is_static)
+            # In static modes, dispatch ONLY when colors actually change (new track, album art, or preset).
+            # Suppress all redundant keep-alive writes so physical LEDs remain 100% solid, steady, with zero flickering or blinking.
+            # In dynamic modes, dispatch on color changes, musical beats, or idle keepalive.
+            time_since_dispatch = t0 - last_dispatch_time
+            if is_static:
+                should_dispatch = not colors_unchanged
+            else:
+                should_dispatch = (not colors_unchanged) or effective_is_beat or (time_since_dispatch >= 0.45)
+
             if should_dispatch:
                 try:
-                    self.controller.set_all_zones(zone_colors, is_beat=effective_is_beat)
+                    self.controller.set_all_zones(zone_colors, is_beat=effective_is_beat, is_static=is_static)
                     last_dispatched_colors = list(zone_colors)
+                    last_dispatch_time = t0
                 except TypeError:
                     try:
-                        self.controller.set_all_zones(zone_colors)
+                        self.controller.set_all_zones(zone_colors, is_beat=effective_is_beat)
                         last_dispatched_colors = list(zone_colors)
+                        last_dispatch_time = t0
+                    except TypeError:
+                        try:
+                            self.controller.set_all_zones(zone_colors)
+                            last_dispatched_colors = list(zone_colors)
+                            last_dispatch_time = t0
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 except Exception:
@@ -390,7 +407,7 @@ class PredatorSyncService:
                         if cur_track and cur_track.cover_path and os.path.exists(cur_track.cover_path):
                             self._latest_track = cur_track
                             self.current_palette = self.color_extractor.extract_from_image_path(cur_track.cover_path)
-                        else:
+                        elif self.current_palette is None:
                             self.current_palette = ColorPaletteExtractor.DEFAULT_PALETTES[0]
 
     def set_brightness(self, val: int):

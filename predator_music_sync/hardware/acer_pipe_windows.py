@@ -113,6 +113,9 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         self._last_send_time: float = 0.0
         self._last_beat_dispatch_time: float = 0.0
         self._last_reconnect_time: float = 0.0
+        self._is_static_mode: bool = False
+        self._static_locked_color: Optional[Tuple[int, int, int]] = None
+        self._static_locked_brightness: Optional[int] = None
 
         # Background worker
         self._worker_thread: Optional[threading.Thread] = None
@@ -169,6 +172,7 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         cnt = self._get_device_count()
         if cnt <= 0:
             return self._fallback_devices()
+        cnt = min(cnt, 4)
 
         devs = []
         for idx in range(cnt):
@@ -178,34 +182,49 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
 
     def _get_device_info(self, device_index: int) -> Dict[str, Any]:
         """
-        Queries Command 1 (get_deviceinfo) for a specific device index to extract physical LED count.
+        Queries device info and hardware LED count for a specific lighting device index.
+        For primary keyboard (device_index 0), queries Command 6 (get_hardware_leds)
+        to extract true physical LED count, falling back to model_info.zone_count.
         """
         p0 = struct.pack('<I', device_index)
-        resp = self._send_command(1, [p0])
         default_leds = self.model_info.zone_count if device_index == 0 else (12 if device_index == 1 else 1)
-        name = "Keyboard" if device_index == 0 else (f"Auxiliary Device {device_index}")
 
-        if resp and len(resp) >= 9:
-            try:
-                val = struct.unpack('<I', resp[5:9])[0]
-                if val > 0:
-                    led_count = val
-                elif len(resp) >= 13:
-                    val2 = struct.unpack('<I', resp[9:13])[0]
-                    led_count = val2 if val2 > 0 else default_leds
-                else:
-                    led_count = default_leds
-            except Exception:
-                led_count = default_leds
+        if device_index == 0:
+            name = "Keyboard"
+            dev_type = "Keyboard"
+            # Query Command 6 to inspect active physical LED count reported by hardware driver
+            cmd6_resp = self._send_command(6, [p0])
+            if cmd6_resp and len(cmd6_resp) >= 9:
+                try:
+                    c6_count = struct.unpack('<I', cmd6_resp[5:9])[0]
+                    if 1 <= c6_count <= 128:
+                        led_count = c6_count
+                    else:
+                        led_count = self.model_info.zone_count
+                except Exception:
+                    led_count = self.model_info.zone_count
+            else:
+                led_count = self.model_info.zone_count
+            is_per_key = (self.model_info.is_per_key or led_count > 4)
         else:
-            led_count = default_leds
+            name = f"Auxiliary Device {device_index}"
+            dev_type = "Auxiliary"
+            is_per_key = False
+            if self.model_info and self.model_info.has_rear_lightbar and device_index == 1:
+                led_count = 12
+                name = "Rear Lightbar"
+            elif self.model_info and self.model_info.has_lid_logo:
+                led_count = 1
+                name = "Lid Logo"
+            else:
+                led_count = 1
 
         return {
             "index": device_index,
             "name": name,
-            "type": "Keyboard" if device_index == 0 else "Auxiliary",
+            "type": dev_type,
             "led_count": led_count,
-            "is_per_key": (led_count > 4 and device_index == 0)
+            "is_per_key": is_per_key
         }
 
     @property
@@ -353,7 +372,7 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         Beats snap immediately (0ms perceived latency).
         Decays and sweeps glide continuously to avoid stepped strobe artifacts.
         """
-        if is_beat:
+        if is_beat or getattr(self, "_is_static_mode", False):
             return list(target)
 
         # Hold beat peak briefly (35ms) to give human eye & physical LEDs time to register flash
@@ -417,11 +436,21 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                 break
             max_diff = max(max_diff, dr, dg, db)
 
+        if getattr(self, "_is_static_mode", False):
+            # In static mode, dispatch ONLY when colors actually differ from the last sent frame.
+            # Suppress ALL redundant periodic keep-alives so physical LEDs remain 100% solid, steady, with zero blinking.
+            return any_diff
+
         if any_diff:
             return True
 
         # Settling frame: if subtle difference exists and no update was sent in >250ms, update hardware
         if max_diff > 0 and (now - self._last_send_time > 0.25):
+            return True
+
+        # Hardware Watchdog Keep-Alive (every 0.45s):
+        # In active dynamic animation modes, refresh at >=0.45s if idle.
+        if (now - self._last_send_time) >= 0.45:
             return True
 
         return False
@@ -454,20 +483,34 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                 self._handle_pipe_error()
                 return None
 
-            resp_buf = ctypes.create_string_buffer(1024)
+            # Read response with 64KB buffer and loop if more data is available
+            full_resp = bytearray()
+            buf_size = 65536
+            resp_buf = ctypes.create_string_buffer(buf_size)
             bytes_read = wintypes.DWORD()
-            res = kernel32.ReadFile(
-                self._pipe_handle,
-                resp_buf,
-                1024,
-                ctypes.byref(bytes_read),
-                None
-            )
-            if not res or bytes_read.value == 0:
-                self._handle_pipe_error()
-                return None
 
-            return resp_buf.raw[:bytes_read.value]
+            while True:
+                res = kernel32.ReadFile(
+                    self._pipe_handle,
+                    resp_buf,
+                    buf_size,
+                    ctypes.byref(bytes_read),
+                    None
+                )
+                err = kernel32.GetLastError()
+                if res and bytes_read.value > 0:
+                    full_resp.extend(resp_buf.raw[:bytes_read.value])
+                    break
+                elif not res and err == 234:  # ERROR_MORE_DATA
+                    full_resp.extend(resp_buf.raw[:bytes_read.value])
+                    continue
+                else:
+                    if len(full_resp) == 0:
+                        self._handle_pipe_error()
+                        return None
+                    break
+
+            return bytes(full_resp)
 
     def _get_device_count(self) -> int:
         resp = self._send_command(0, [])
@@ -519,16 +562,45 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         """Physical write to the Acer EC pipe with dynamic zone expansion and auxiliary sync."""
         scale = self._brightness / 100.0
 
-        # 1. Primary Keyboard Write (dynamically expanded across physical LEDs)
-        kb_leds = self.primary_led_count
+        # In static mode, lock in hardware static mode with primary album color.
+        # This sends Command 2 (mode=0 STATIC) with 6 parameters to AcerLightingService,
+        # updating the hardware EC and LightingProfile.ini so that service watchdog timeouts
+        # retain the album static color instead of reverting to white (#F1F1F1).
+        if getattr(self, "_is_static_mode", False) and colors:
+            primary_c = colors[1] if len(colors) > 1 else colors[0]
+            if (self._static_locked_color != primary_c or
+                self._static_locked_brightness != self._brightness):
+                self.set_hardware_mode(
+                    mode=0,
+                    speed=5,
+                    brightness=self._brightness,
+                    direction=1,
+                    r=primary_c[0],
+                    g=primary_c[1],
+                    b=primary_c[2]
+                )
+                self._static_locked_color = primary_c
+                self._static_locked_brightness = self._brightness
+        else:
+            self._static_locked_color = None
+            self._static_locked_brightness = None
+
+        # 1. Primary Keyboard Write (strictly mapped to hardware zone count)
+        # On 4-zone laptops (e.g. Helios Neo 16), kb_leds is strictly 4.
+        # On per-key laptops, primary_led_count reflects the key count (e.g. 84).
+        if self.model_info and not self.model_info.is_per_key:
+            kb_leds = self.model_info.zone_count
+        else:
+            kb_leds = self.primary_led_count
         kb_colors = map_4zone_to_n(colors, kb_leds)
         success = self._write_device_raw(self.device_index, kb_colors, scale)
 
-        # 2. Auxiliary Devices Sync (Rear Lightbar, Lid Logo)
-        if self.sync_auxiliary and len(self.devices) > 1:
+        # 2. Auxiliary Devices Sync (Rear Lightbar, Lid Logo) - only if supported by hardware model
+        has_aux = bool(self.model_info and (self.model_info.has_rear_lightbar or self.model_info.has_lid_logo))
+        if self.sync_auxiliary and has_aux and len(self.devices) > 1:
             for dev in self.devices[1:]:
                 dev_idx = dev.get("index", 1)
-                dev_leds = dev.get("led_count", 1)
+                dev_leds = max(1, min(64, dev.get("led_count", 1)))
                 is_beat = self._has_pending_beat
                 aux_colors = map_auxiliary_device_colors(colors, dev_leds, is_beat=is_beat)
                 self._write_device_raw(dev_idx, aux_colors, scale)
@@ -571,8 +643,11 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         if len(colors) < self.NUM_ZONES:
             return False
 
+        is_static = kwargs.get("is_static", False)
+
         if sync:
             with self._state_lock:
+                self._is_static_mode = is_static
                 self._target_colors = list(colors[:self.NUM_ZONES])
             return self._write_hardware_sync(colors[:self.NUM_ZONES])
 
@@ -585,10 +660,14 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                 )
                 for c in colors[:self.NUM_ZONES]
             ]
+            self._is_static_mode = is_static
             self._target_colors = clamped
             self._current_colors = list(clamped)
 
-            if is_beat:
+            if is_static:
+                self._has_pending_beat = False
+                self._latched_beat_frame = None
+            elif is_beat:
                 self._has_pending_beat = True
                 self._latched_beat_frame = list(clamped)
                 self._latched_beat_time = time.perf_counter()
@@ -599,30 +678,38 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
     def set_hardware_mode(
         self,
         mode: int,
-        speed: int,
-        brightness: int,
-        direction: int,
-        r: int,
-        g: int,
-        b: int
+        speed: int = 5,
+        brightness: Optional[int] = None,
+        direction: int = 1,
+        r: int = 0,
+        g: int = 0,
+        b: int = 0,
+        device_index: Optional[int] = None
     ) -> bool:
+        """
+        Dispatches Command 2 (set_devicemode) with 6 parameters to AcerLightingService.
+        mode: Mode value (0 = STATIC, 1 = BREATHING, 2 = NEON, etc.).
+        Locks the hardware EC and updates LightingProfile.ini internally.
+        """
         # Guard against AcerLightingService C++ bug: Direct modes (1 or 255) corrupt LightingProfile.ini and cause 0xc0000374 heap crash
         if mode in (1, 255):
             return True
-        self.brightness = brightness
-        p0 = struct.pack('<I', self.device_index)
-        p1 = struct.pack('<I', mode)
-        settings = bytearray(32)
-        settings[0] = mode & 0xFF
-        settings[1] = speed & 0xFF
-        settings[2] = brightness & 0xFF
-        settings[3] = direction & 0xFF
-        settings[4] = r & 0xFF
-        settings[5] = g & 0xFF
-        settings[6] = b & 0xFF
-        p2 = bytes(settings)
-        resp = self._send_command(2, [p0, p1, p2])
-        return resp is not None
+        if brightness is not None:
+            self.brightness = brightness
+
+        dev_idx = self.device_index if device_index is None else int(device_index)
+        p0 = struct.pack('<I', dev_idx)
+        p1 = struct.pack('<I', int(mode))
+        p2 = bytes([int(r) & 0xFF, int(g) & 0xFF, int(b) & 0xFF, 0])
+        p3 = struct.pack('<I', int(speed))
+        p4 = struct.pack('<I', int(self._brightness))
+        p5 = struct.pack('<I', int(direction))
+
+        resp = self._send_command(2, [p0, p1, p2, p3, p4, p5])
+        if resp and len(resp) >= 9:
+            status = struct.unpack('<I', resp[5:9])[0]
+            return status == 0
+        return False
 
     def close(self):
         self._running = False
