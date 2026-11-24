@@ -98,6 +98,7 @@ class PredatorTrayManager:
         self._disable_on_battery_saver = True
 
         self._icon: Optional[pystray.Icon] = None
+        self._icon_lock = threading.RLock()
         self._has_notified_tray = False
 
     def build_menu(self) -> Menu:
@@ -151,7 +152,7 @@ class PredatorTrayManager:
             ),
             Menu.SEPARATOR,
             item(lambda it: f"Power: {self._power_status_text}", lambda icon, it: None, enabled=False),
-            item(f"Hardware: {self._hw_status_text}", lambda icon, it: None, enabled=False),
+            item(lambda it: f"Hardware: {self._hw_status_text}", lambda icon, it: None, enabled=False),
             Menu.SEPARATOR,
             item("Hide to System Tray", self._handle_hide_window),
             item("Exit Completely", self._handle_exit_app)
@@ -161,78 +162,93 @@ class PredatorTrayManager:
         """Starts the system tray icon detached on Windows."""
         try:
             icon_img = generate_predator_tray_icon()
-            self._icon = pystray.Icon(
-                name="MusicalPredator",
-                icon=icon_img,
-                title="MusicalPredator (Helios Neo 16)",
-                menu=self.build_menu()
-            )
-            self._icon.run_detached()
+            with self._icon_lock:
+                self._icon = pystray.Icon(
+                    name="MusicalPredator",
+                    icon=icon_img,
+                    title="MusicalPredator (Helios Neo 16)",
+                    menu=self.build_menu()
+                )
+                self._icon.run_detached()
         except Exception as e:
             print(f"Warning: System tray icon could not be initialized: {e}", flush=True)
 
     def stop(self):
         """Removes the icon from the system tray."""
-        if self._icon:
+        with self._icon_lock:
+            icon = self._icon
+            self._icon = None
+        if icon:
             try:
-                self._icon.stop()
+                icon.stop()
             except Exception:
                 pass
-            self._icon = None
+
+    def _safe_update_menu(self):
+        with self._icon_lock:
+            if self._icon:
+                try:
+                    self._icon.update_menu()
+                except Exception:
+                    pass
 
     def notify_minimized_to_tray(self, force: bool = False):
         """Notifies the user via Windows balloon notification that the app is active in the tray."""
-        if (not self._has_notified_tray or force) and self._icon:
-            self._has_notified_tray = True
-            try:
-                self._icon.notify(
-                    "MusicalPredator is running in the background.\nDouble-click this tray icon to open dashboard.",
-                    "MusicalPredator"
-                )
-            except Exception:
-                pass
+        with self._icon_lock:
+            if (not self._has_notified_tray or force) and self._icon:
+                self._has_notified_tray = True
+                try:
+                    self._icon.notify(
+                        "MusicalPredator is running in the background.\nClick or double-click this tray icon to open dashboard.",
+                        "MusicalPredator"
+                    )
+                except Exception:
+                    pass
 
     def update_lighting_state(self, active: bool):
+        changed = (self._lighting_active != active)
         self._lighting_active = active
-        if self._icon:
-            try:
-                self._icon.update_menu()
-            except Exception:
-                pass
+        if changed:
+            self._safe_update_menu()
 
     def update_mode(self, mode: str):
+        changed = (self._current_mode != mode)
         self._current_mode = mode
-        if self._icon:
-            try:
-                self._icon.update_menu()
-            except Exception:
-                pass
+        if changed:
+            self._safe_update_menu()
 
     def update_autostart_state(self):
-        if self._icon:
-            try:
-                self._icon.update_menu()
-            except Exception:
-                pass
+        self._safe_update_menu()
+
+    def update_hardware_status(self, status_text: str):
+        """Updates the hardware status line shown in the tray context menu."""
+        if status_text != self._hw_status_text:
+            self._hw_status_text = status_text
+            self._safe_update_menu()
 
     def update_power_status(self, is_plugged: bool, is_saver_active: bool, battery_pct: int = 100):
         """Updates tray icon tooltip and context menu power status line."""
         if is_saver_active:
-            self._power_status_text = "Battery Saver (Suspended)"
+            new_power_text = "Battery Saver (Suspended)"
             title_text = "MusicalPredator • Battery Saver (Suspended)"
         elif not is_plugged:
-            self._power_status_text = f"On Battery ({battery_pct}%)"
+            new_power_text = f"On Battery ({battery_pct}%)"
             title_text = f"MusicalPredator • On Battery ({battery_pct}%)"
         else:
-            self._power_status_text = "Plugged In"
+            new_power_text = "Plugged In"
             title_text = "MusicalPredator • Plugged In"
 
-        if self._icon:
-            try:
-                self._icon.title = title_text
-                self._icon.update_menu()
-            except Exception:
-                pass
+        if new_power_text == self._power_status_text:
+            return
+        self._power_status_text = new_power_text
+
+        with self._icon_lock:
+            if self._icon:
+                try:
+                    self._icon.title = title_text[:120]
+                    self._icon.update_menu()
+                except Exception:
+                    pass
 
     # Handlers
     def _handle_show_window(self, icon, item):
@@ -247,26 +263,20 @@ class PredatorTrayManager:
         self._lighting_active = not self._lighting_active
         if self.on_toggle_lighting:
             self.on_toggle_lighting(self._lighting_active)
-        if self._icon:
-            self._icon.update_menu()
+        self._safe_update_menu()
 
     def _handle_toggle_autostart(self, icon, item):
         new_val = not is_autostart_enabled()
         set_autostart(new_val)
         if self.on_toggle_autostart:
             self.on_toggle_autostart(new_val)
-        if self._icon:
-            try:
-                self._icon.update_menu()
-            except Exception:
-                pass
+        self._safe_update_menu()
 
     def _handle_set_mode(self, mode_name: str):
         self._current_mode = mode_name
         if self.on_set_mode:
             self.on_set_mode(mode_name)
-        if self._icon:
-            self._icon.update_menu()
+        self._safe_update_menu()
 
     def _handle_exit_app(self, icon, item):
         if self.on_exit_app:

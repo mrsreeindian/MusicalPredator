@@ -19,7 +19,7 @@ from ..core.color_extractor import ColorPaletteExtractor, ColorPalette, RGBColor
 from ..core.animations import ANIMATION_REGISTRY, BaseAnimation, SpectrumEqualizer
 from ..hardware.factory import get_keyboard_controller
 from ..hardware.base import KeyboardControllerBase
-from ..utils.power import PowerMonitor, PowerStatus
+from ..utils.power import PowerMonitor, PowerStatus, set_process_power_throttling
 
 
 class PredatorSyncService:
@@ -174,13 +174,15 @@ class PredatorSyncService:
         }
 
         self._is_power_suspended: bool = False
+        self._resume_resync_pending: bool = False
         self._power_listeners: List[Callable[[PowerStatus], None]] = []
 
         self.power_monitor = PowerMonitor(
             poll_interval=1.5,
             on_ac_power_change=self._on_ac_power_changed,
             on_battery_saver_change=self._on_battery_saver_changed,
-            on_battery_percent_change=self._on_battery_percent_changed
+            on_battery_percent_change=self._on_battery_percent_changed,
+            on_system_resume=self._on_system_resume,
         )
         init_status = self.power_monitor.get_status()
         self._is_plugged_in: bool = init_status.is_plugged_in
@@ -207,8 +209,10 @@ class PredatorSyncService:
             return
         self._is_running = True
 
-        # Optimize Windows timer resolution to 1ms for stable 60 FPS pacing
+        # Optimize Windows timer resolution and opt out of EcoQoS background throttling
+        # when minimized/closed to tray so 60 FPS background sync does not starve.
         if sys.platform == "win32":
+            set_process_power_throttling(True)
             try:
                 ctypes.windll.winmm.timeBeginPeriod(1)
             except Exception:
@@ -245,12 +249,13 @@ class PredatorSyncService:
             pass
         self.controller.close()
 
-        # Restore Windows timer resolution
+        # Restore Windows timer resolution and default power throttling
         if sys.platform == "win32":
             try:
                 ctypes.windll.winmm.timeEndPeriod(1)
             except Exception:
                 pass
+            set_process_power_throttling(False)
 
         print("PredatorSyncService stopped cleanly.", flush=True)
 
@@ -283,28 +288,34 @@ class PredatorSyncService:
                 continue
 
             t0 = time.perf_counter()
-            dt = t0 - last_time
+            raw_dt = t0 - last_time
             last_time = t0
+            if raw_dt > 2.0:
+                self._on_system_resume()
+            dt = max(0.0, min(0.1, raw_dt))
 
             # 1. Capture current audio beat state
             audio_state = self.audio_engine.get_state()
 
             # 2. Compute 4-zone colors
             with self._lock:
+                if self._resume_resync_pending:
+                    self._resume_resync_pending = False
+                    last_dispatched_colors = None
+
                 if self._lighting_enabled:
                     zone_colors = list(self.animation.update(audio_state, self.current_palette, dt))
+                    for z, override_color in self.zone_overrides.items():
+                        if override_color is not None and 0 <= z < len(zone_colors):
+                            zone_colors[z] = override_color
                 else:
                     zone_colors = [(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)]
-
-                for z, override_color in self.zone_overrides.items():
-                    if override_color is not None and 0 <= z < len(zone_colors):
-                        zone_colors[z] = override_color
 
                 self._latest_colors = list(zone_colors)
                 self._latest_audio_state = audio_state
                 track = self._latest_track
                 listeners = list(self._state_listeners)
-                is_static = (self.active_animation_name in ("Static Album Art", "Static Album Dominant"))
+                is_static = (self.active_animation_name in ("Static Album Art", "Static Album Dominant")) or (not self._lighting_enabled)
 
             is_silent = (audio_state.overall_energy < 0.05 or getattr(audio_state, "is_silent", False))
             colors_unchanged = (last_dispatched_colors is not None and zone_colors == last_dispatched_colors)
@@ -437,11 +448,16 @@ class PredatorSyncService:
     def toggle_lighting(self, enabled: bool):
         with self._lock:
             self._lighting_enabled = enabled
-            if not enabled:
+        if not enabled:
+            try:
+                self.controller.set_all_zones([(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)], is_static=True)
+            except TypeError:
                 try:
                     self.controller.set_all_zones([(0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)])
                 except Exception:
                     pass
+            except Exception:
+                pass
 
     def load_preset(self, preset_name: str) -> bool:
         if preset_name not in self.PRESETS:
@@ -626,6 +642,23 @@ class PredatorSyncService:
         """Fired when battery percentage updates."""
         status = self.power_monitor.get_status()
         self._notify_power_listeners(status)
+
+    def _on_system_resume(self):
+        """Recovers audio capture and re-syncs hardware LEDs after Windows sleep/idle."""
+        if self._is_power_suspended or not self._is_running:
+            return
+        with self._lock:
+            self._resume_resync_pending = True
+        if hasattr(self.audio_engine, "recover_if_stalled"):
+            try:
+                self.audio_engine.recover_if_stalled()
+            except Exception:
+                pass
+        if hasattr(self.controller, "force_resync"):
+            try:
+                self.controller.force_resync()
+            except Exception:
+                pass
 
 
 # Modern Alias

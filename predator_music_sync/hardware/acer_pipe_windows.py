@@ -69,6 +69,19 @@ kernel32.ReadFile.restype = wintypes.BOOL
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.CloseHandle.restype = wintypes.BOOL
 
+kernel32.PeekNamedPipe.argtypes = [
+    wintypes.HANDLE,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+    ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.PeekNamedPipe.restype = wintypes.BOOL
+
+kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+kernel32.WaitNamedPipeW.restype = wintypes.BOOL
+
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 
@@ -113,6 +126,8 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         self._last_send_time: float = 0.0
         self._last_beat_dispatch_time: float = 0.0
         self._last_reconnect_time: float = 0.0
+        self._last_pipe_health_check: float = 0.0
+        self._force_resync: bool = False
         self._is_static_mode: bool = False
         self._static_locked_color: Optional[Tuple[int, int, int]] = None
         self._static_locked_brightness: Optional[int] = None
@@ -252,8 +267,21 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                 None
             )
             if h in (None, 0, INVALID_HANDLE_VALUE, -1):
-                self._pipe_handle = INVALID_HANDLE_VALUE
-                return False
+                err = kernel32.GetLastError()
+                if err == 231:  # ERROR_PIPE_BUSY
+                    if kernel32.WaitNamedPipeW(self.PIPE_NAME, 150):
+                        h = kernel32.CreateFileW(
+                            self.PIPE_NAME,
+                            GENERIC_READ | GENERIC_WRITE,
+                            0,
+                            None,
+                            OPEN_EXISTING,
+                            0,
+                            None,
+                        )
+                if h in (None, 0, INVALID_HANDLE_VALUE, -1):
+                    self._pipe_handle = INVALID_HANDLE_VALUE
+                    return False
             self._pipe_handle = h
             return True
         except Exception:
@@ -274,22 +302,55 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                 self.devices = self._enumerate_devices()
                 self.primary_led_count = self.devices[0]["led_count"] if self.devices else self.model_info.zone_count
                 self.get_hardware_leds()
+                self._static_locked_color = None
+                self._static_locked_brightness = None
+                self._force_resync = True
+                self._frame_ready_event.set()
                 return True
             else:
-                self.close()
+                # Never call self.close() here: _init_pipe() runs on _worker_thread and close()
+                # would set _running=False, permanently killing the reconnection loop.
+                self._handle_pipe_error()
                 self.devices = self._fallback_devices()
                 self.primary_led_count = self.model_info.zone_count
                 return False
 
     def _handle_pipe_error(self):
         """Safely cleans up broken pipe handle on transmission error."""
-        if self._pipe_handle not in (None, 0, INVALID_HANDLE_VALUE, -1):
-            try:
-                kernel32.CloseHandle(self._pipe_handle)
-            except Exception:
-                pass
-            self._pipe_handle = INVALID_HANDLE_VALUE
-        self._is_connected = False
+        with self._pipe_lock:
+            if self._pipe_handle not in (None, 0, INVALID_HANDLE_VALUE, -1):
+                try:
+                    kernel32.CloseHandle(self._pipe_handle)
+                except Exception:
+                    pass
+                self._pipe_handle = INVALID_HANDLE_VALUE
+            self._is_connected = False
+        self._static_locked_color = None
+        self._static_locked_brightness = None
+        self._force_resync = True
+
+    def force_resync(self):
+        """Forces the next frame and hardware mode lock to be re-applied to the EC."""
+        with self._state_lock:
+            self._static_locked_color = None
+            self._static_locked_brightness = None
+            self._force_resync = True
+        self._frame_ready_event.set()
+
+    def _check_pipe_health(self) -> bool:
+        """Non-intrusively verifies the named pipe handle is still alive without writing to LEDs."""
+        with self._pipe_lock:
+            if self._pipe_handle in (None, 0, INVALID_HANDLE_VALUE, -1):
+                self._is_connected = False
+                return False
+            avail = wintypes.DWORD(0)
+            ok = kernel32.PeekNamedPipe(
+                self._pipe_handle, None, 0, None, ctypes.byref(avail), None
+            )
+            if not ok:
+                self._handle_pipe_error()
+                return False
+            return True
 
     def _start_worker(self):
         self._running = True
@@ -321,6 +382,12 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                             # Reconnected to hardware!
                             pass
                     continue
+
+                # Periodically verify pipe health non-intrusively (even in static mode when no writes occur)
+                if (now - self._last_pipe_health_check) >= 2.0:
+                    self._last_pipe_health_check = now
+                    if not self._check_pipe_health():
+                        continue
 
                 target: Optional[List[Tuple[int, int, int]]] = None
                 is_beat: bool = False
@@ -416,6 +483,9 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
         Adaptive dirty check: suppresses identical / imperceptible bus traffic
         while ensuring settling frames converge with 0 error.
         """
+        if getattr(self, "_force_resync", False):
+            return True
+
         scale = self._brightness / 100.0
         any_diff = False
         max_diff = 0
@@ -605,18 +675,24 @@ class AcerLightingNamedPipeBackend(KeyboardControllerBase):
                 aux_colors = map_auxiliary_device_colors(colors, dev_leds, is_beat=is_beat)
                 self._write_device_raw(dev_idx, aux_colors, scale)
 
-        # Update cached colors for logical 4-zone state tracking
+        # Update cached colors for logical 4-zone state tracking only on successful write
         with self._state_lock:
-            self._last_sent_scaled = [
-                (int(round(c[0] * scale)), int(round(c[1] * scale)), int(round(c[2] * scale)))
-                for c in colors[:self.NUM_ZONES]
-            ]
-            self._current_colors = [
-                (int(max(0, min(255, c[0]))),
-                 int(max(0, min(255, c[1]))),
-                 int(max(0, min(255, c[2]))))
-                for c in colors[:self.NUM_ZONES]
-            ]
+            if success:
+                self._force_resync = False
+                self._last_sent_scaled = [
+                    (int(round(c[0] * scale)), int(round(c[1] * scale)), int(round(c[2] * scale)))
+                    for c in colors[:self.NUM_ZONES]
+                ]
+                self._current_colors = [
+                    (int(max(0, min(255, c[0]))),
+                     int(max(0, min(255, c[1]))),
+                     int(max(0, min(255, c[2]))))
+                    for c in colors[:self.NUM_ZONES]
+                ]
+            else:
+                self._static_locked_color = None
+                self._static_locked_brightness = None
+                self._force_resync = True
 
         return success
 

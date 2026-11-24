@@ -8,9 +8,10 @@ import os
 import sys
 import time
 import json
+import queue
 import ctypes
 import threading
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Callable
 
 # Ensure package directory is on sys.path for direct execution
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +40,15 @@ class PredatorMusicSyncApp:
 
     def __init__(self, target_fps: int = 60, prefer_virtual: bool = False, start_minimized: bool = False):
         self.start_minimized = start_minimized
+        self._main_thread_id = threading.get_ident()
+        self._gui_dispatch_lock = threading.Lock()
+        self._gui_queue: queue.Queue = queue.Queue(maxsize=256)
+        self._gui_pump_id: Optional[str] = None
+        self._is_exiting = False
+        self._last_gui_track_id: Optional[str] = None
+        self._last_gui_hw_connected: Optional[bool] = None
+        self._last_tray_power_key: Optional[Tuple[bool, bool, int]] = None
+        self._latest_power_status: Optional[PowerStatus] = None
 
         # 1. Initialize dedicated background sync service
         self.service = PredatorSyncService(
@@ -128,22 +138,87 @@ class PredatorMusicSyncApp:
         init_power = self.service.get_power_status()
         self._on_power_state_changed(init_power)
 
+    def _dispatch_to_gui(self, fn: Callable[[], None]):
+        """Thread-safely schedules a GUI callback onto the Tkinter main thread without cross-thread Tcl calls."""
+        if self._is_exiting or not self.gui or not self.gui.root:
+            return
+        if threading.get_ident() == self._main_thread_id:
+            try:
+                if self.gui.root.winfo_exists():
+                    fn()
+            except Exception:
+                pass
+            return
+        try:
+            self._gui_queue.put_nowait(fn)
+        except queue.Full:
+            # Drop oldest pending callback to avoid unbounded buildup
+            try:
+                self._gui_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._gui_queue.put_nowait(fn)
+            except queue.Full:
+                pass
+
+    def _start_gui_queue_pump(self):
+        """Starts the main-thread Tkinter queue poller (safe even when window is withdrawn in tray)."""
+        if self._is_exiting or not self.gui or not self.gui.root:
+            return
+        self._drain_gui_queue()
+
+    def _drain_gui_queue(self):
+        """Drains pending cross-thread UI callbacks on the Tkinter main thread."""
+        if self._is_exiting or not self.gui or not self.gui.root:
+            self._gui_pump_id = None
+            return
+        root = self.gui.root
+        try:
+            if not root.winfo_exists():
+                self._gui_pump_id = None
+                return
+        except Exception:
+            self._gui_pump_id = None
+            return
+
+        for _ in range(32):
+            try:
+                fn = self._gui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                pass
+            if self._is_exiting or not self.gui or not self.gui.root:
+                self._gui_pump_id = None
+                return
+
+        if not self._is_exiting and self.gui and self.gui.root:
+            try:
+                if self.gui.root.winfo_exists():
+                    self._gui_pump_id = self.gui.root.after(50, self._drain_gui_queue)
+            except Exception:
+                self._gui_pump_id = None
+
     def _on_power_state_changed(self, status: PowerStatus):
         """Dispatches power state updates to GUI badge and System Tray."""
+        self._latest_power_status = status
         if self.tray:
-            if hasattr(self.tray, 'update_power_status'):
-                self.tray.update_power_status(status.is_plugged_in, status.is_battery_saver, status.battery_percent)
-            power_desc = f" • {status.status_label}"
-            hw_status_str = f"{self.service.controller_name} [CONNECTED]{power_desc}" if self.service.is_hw else f"{self.service.controller_name} [EMULATION]{power_desc}"
-            if hasattr(self.tray, 'update_hardware_status'):
-                self.tray.update_hardware_status(hw_status_str)
+            power_key = (status.is_plugged_in, status.is_battery_saver, status.battery_percent)
+            if power_key != self._last_tray_power_key:
+                self._last_tray_power_key = power_key
+                if hasattr(self.tray, 'update_power_status'):
+                    self.tray.update_power_status(status.is_plugged_in, status.is_battery_saver, status.battery_percent)
+                power_desc = f" • {status.status_label}"
+                hw_status_str = f"{self.service.controller_name} [CONNECTED]{power_desc}" if self.service.is_hw else f"{self.service.controller_name} [EMULATION]{power_desc}"
+                if hasattr(self.tray, 'update_hardware_status'):
+                    self.tray.update_hardware_status(hw_status_str)
 
         if self.gui and hasattr(self.gui, 'update_power_status'):
             if self.gui.root:
-                try:
-                    self.gui.root.after(0, lambda: self.gui.update_power_status(status))
-                except Exception:
-                    pass
+                self._dispatch_to_gui(lambda s=status: self.gui.update_power_status(s))
             else:
                 try:
                     self.gui.update_power_status(status)
@@ -160,53 +235,77 @@ class PredatorMusicSyncApp:
 
     def _on_service_state_tick(self, colors: List[RGBColor], track: Optional[MediaTrackInfo], state: Optional[AudioBeatState]):
         """Transfers live 60 FPS service data to GUI buffers."""
-        if self.gui:
-            self.gui.update_zone_colors(colors)
-            if track:
+        if self._is_exiting or not self.gui:
+            return
+        self.gui.update_zone_colors(colors)
+        if track:
+            tid = track.track_id
+            if tid != self._last_gui_track_id:
+                self._last_gui_track_id = tid
                 self.gui.update_track_info(track)
-            if state:
-                self.gui.update_audio_state(state)
-            if hasattr(self.service, "is_hardware_connected") and hasattr(self.gui, "update_hardware_connection"):
-                is_conn = self.service.is_hardware_connected
-                if is_conn != getattr(self.gui, "is_hardware_connected", None):
-                    if self.gui.root:
-                        try:
-                            self.gui.root.after(0, lambda: self.gui.update_hardware_connection(is_conn))
-                        except Exception:
-                            pass
+        if state:
+            self.gui.update_audio_state(state)
+        if hasattr(self.service, "is_hardware_connected") and hasattr(self.gui, "update_hardware_connection"):
+            is_conn = self.service.is_hardware_connected
+            if is_conn != self._last_gui_hw_connected:
+                self._last_gui_hw_connected = is_conn
+                if self.tray and hasattr(self.tray, "update_hardware_status"):
+                    power_desc = f" • {self._latest_power_status.status_label}" if self._latest_power_status else ""
+                    if not self.service.is_hw:
+                        hw_status_str = f"{self.service.controller_name} [EMULATION]{power_desc}"
+                    elif is_conn:
+                        hw_status_str = f"{self.service.controller_name} [CONNECTED]{power_desc}"
+                    else:
+                        hw_status_str = f"{self.service.controller_name} [SERVICE STOPPED]{power_desc}"
+                    self.tray.update_hardware_status(hw_status_str)
+                self._dispatch_to_gui(lambda c=is_conn: self.gui.update_hardware_connection(c))
 
     def _on_window_hidden_to_tray(self):
         """Called when user closes the window with the 'X' button or 'Hide to Tray' button."""
         self.tray.notify_minimized_to_tray()
 
+    def _restore_and_sync_gui(self):
+        """Restores GUI window and refreshes buffered state after tray hiding."""
+        if not self.gui:
+            return
+        self.gui.restore_from_tray()
+        if self._latest_power_status and hasattr(self.gui, "update_power_status"):
+            try:
+                self.gui.update_power_status(self._latest_power_status)
+            except Exception:
+                pass
+        if hasattr(self.gui, "update_hardware_connection"):
+            try:
+                self.gui.update_hardware_connection(self.service.is_hardware_connected)
+            except Exception:
+                pass
+        latest_track = getattr(self.service, "_latest_track", None)
+        if latest_track:
+            self.gui.update_track_info(latest_track)
+
     def restore_window(self):
         """Restores and brings the GUI window to the foreground."""
-        if self.gui and self.gui.root:
-            self.gui.root.after(0, self.gui.restore_from_tray)
+        self._dispatch_to_gui(self._restore_and_sync_gui)
 
     def hide_window(self):
         """Hides the GUI window to the system tray."""
-        if self.gui and self.gui.root:
-            self.gui.root.after(0, self.gui.hide_to_tray)
+        self._dispatch_to_gui(self.gui.hide_to_tray)
 
     def set_animation_mode(self, mode_name: str):
         self.service.set_animation_mode(mode_name)
         self.tray.update_mode(mode_name)
-        if self.gui and self.gui.root:
-            self.gui.root.after(0, lambda: self.gui.set_mode(mode_name, notify=False))
+        self._dispatch_to_gui(lambda m=mode_name: self.gui.set_mode(m, notify=False))
 
     def toggle_lighting(self, enabled: bool):
         self.service.toggle_lighting(enabled)
         self.tray.update_lighting_state(enabled)
-        if self.gui and self.gui.root:
-            self.gui.root.after(0, lambda: self.gui.set_lighting_active(enabled, notify=False))
+        self._dispatch_to_gui(lambda e=enabled: self.gui.set_lighting_active(e, notify=False))
 
     def toggle_autostart(self, enabled: bool):
         set_autostart(enabled)
         if self.tray:
             self.tray.update_autostart_state()
-        if self.gui and self.gui.root:
-            self.gui.root.after(0, lambda: self.gui.set_autostart_state(enabled))
+        self._dispatch_to_gui(lambda e=enabled: self.gui.set_autostart_state(e))
 
     def save_profile(self, name: str, filepath: Optional[str] = None) -> str:
         if filepath is None:
@@ -273,17 +372,36 @@ class PredatorMusicSyncApp:
 
     def exit_completely(self):
         """Cleanly terminates the background service, system tray, and GUI."""
-        if getattr(self, "_is_exiting", False):
-            return
-        self._is_exiting = True
+        with self._gui_dispatch_lock:
+            if self._is_exiting:
+                return
+            self._is_exiting = True
         print("Shutting down Predator Sync Application completely...", flush=True)
+        try:
+            self.service.remove_state_listener(self._on_service_state_tick)
+            self.service.remove_power_listener(self._on_power_state_changed)
+        except Exception:
+            pass
         self.service.stop()
         self.tray.stop()
         if self.gui and self.gui.root:
-            try:
-                self.gui.root.after(0, self.gui.exit_application)
-            except Exception:
-                pass
+            root = self.gui.root
+            if threading.get_ident() == self._main_thread_id:
+                if self._gui_pump_id:
+                    try:
+                        root.after_cancel(self._gui_pump_id)
+                    except Exception:
+                        pass
+                    self._gui_pump_id = None
+                try:
+                    self.gui.exit_application()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self._gui_queue.put_nowait(self.gui.exit_application)
+                except Exception:
+                    pass
 
     def start(self):
         """Starts background service, tray icon, and launches GUI."""
@@ -293,13 +411,12 @@ class PredatorMusicSyncApp:
         # 2. Start Windows System Tray Icon
         self.tray.start()
 
-        # 3. Create GUI Window
+        # 3. Create GUI Window and start main-thread cross-thread queue pump
         self.gui.create_window()
+        self._start_gui_queue_pump()
 
         if self.start_minimized:
-            self.gui.root.withdraw()
-            self.gui._is_gui_active = False
-            self.tray.notify_minimized_to_tray()
+            self.gui.hide_to_tray()
 
         # 4. Run GUI Mainloop on Main Thread
         try:

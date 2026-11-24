@@ -47,10 +47,13 @@ class AudioBeatSyncEngine:
         self._is_running = False
         self._is_paused = False
         self._last_reconnect_time = 0.0
+        self._last_callback_time = 0.0
         self._state = AudioBeatState()
         self._lock = threading.Lock()
+        self._stream_lock = threading.RLock()
 
         # Auto-detect optimal device and its native sample rate
+        self._preferred_device_index = device_index
         self.device_index, self.sample_rate = self._find_optimal_device_and_rate(prefer_device=device_index)
 
         # Automatic Gain Control (AGC) trackers
@@ -142,25 +145,27 @@ class AudioBeatSyncEngine:
 
         was_running = self._is_running
 
-        # Safely stop existing stream outside the lock to prevent deadlock with audio callback
-        self._is_running = False
-        old_stream = self._stream
-        self._stream = None
-        if old_stream is not None:
-            try:
-                old_stream.stop()
-                old_stream.close()
-            except Exception:
-                pass
+        with self._stream_lock:
+            # Safely stop existing stream outside audio callback lock to prevent deadlock
+            self._is_running = False
+            old_stream = self._stream
+            self._stream = None
+            if old_stream is not None:
+                try:
+                    old_stream.stop()
+                    old_stream.close()
+                except Exception:
+                    pass
 
-        with self._lock:
-            self.device_index = device_index
-            self.sample_rate = sr
-            self._setup_fft_bins()
-            self._reset_agc()
+            with self._lock:
+                self._preferred_device_index = device_index
+                self.device_index = device_index
+                self.sample_rate = sr
+                self._setup_fft_bins()
+                self._reset_agc()
 
-        if was_running:
-            self.start()
+            if was_running:
+                self.start()
 
         return True
 
@@ -227,12 +232,11 @@ class AudioBeatSyncEngine:
         return None, 48000
 
     def add_beat_callback(self, cb: Callable[[AudioBeatState], None]):
-        self._beat_callbacks.append(cb)
+        with self._lock:
+            self._beat_callbacks.append(cb)
 
-    def start(self):
-        if self._is_running:
-            return
-        self._is_running = True
+    def _open_input_stream(self) -> bool:
+        """Opens the sounddevice InputStream on the preferred or fallback device."""
         try:
             channels = min(2, sd.query_devices(self.device_index)['max_input_channels']) if self.device_index is not None else 1
             self._stream = sd.InputStream(
@@ -243,7 +247,15 @@ class AudioBeatSyncEngine:
                 callback=self._audio_callback
             )
             self._stream.start()
+            self._last_callback_time = time.monotonic()
+            return True
         except Exception:
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
             try:
                 self._stream = sd.InputStream(
                     samplerate=self.sample_rate,
@@ -252,27 +264,83 @@ class AudioBeatSyncEngine:
                     callback=self._audio_callback
                 )
                 self._stream.start()
+                self._last_callback_time = time.monotonic()
+                return True
             except Exception:
-                self._is_running = False
+                if self._stream is not None:
+                    try:
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+                return False
+
+    def start(self):
+        with self._stream_lock:
+            if self._is_running:
+                return
+            self._is_running = True
+            self._last_callback_time = time.monotonic()
+            # Keep _is_running True even if initial stream open fails transiently
+            # so _check_stream_health() can automatically recover when device returns.
+            self._open_input_stream()
 
     def stop(self):
-        self._is_running = False
-        self._is_paused = False
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        with self._stream_lock:
+            self._is_running = False
+            self._is_paused = False
+            if self._stream:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
 
     def pause(self):
         """
         Suspends audio stream capture, dropping CPU to 0.0%.
         Resets active state to pure silence.
         """
+        with self._stream_lock:
+            with self._lock:
+                self._is_paused = True
+                self._state.is_beat = False
+                self._state.is_hard_kick = False
+                self._state.beat_strength = 0.0
+                self._state.overall_energy = 0.0
+                self._state.smoothed_bands = np.zeros(4, dtype=np.float32)
+                self._state.band_energies = np.zeros(4, dtype=np.float32)
+                self._state.is_silent = True
+            if self._stream is not None:
+                try:
+                    self._stream.stop()
+                except Exception:
+                    pass
+
+    def resume(self):
+        """Resumes audio stream capture from paused state."""
+        with self._stream_lock:
+            with self._lock:
+                if not self._is_paused:
+                    return
+                self._is_paused = False
+            if self._is_running:
+                self._last_callback_time = time.monotonic()
+                if self._stream is not None:
+                    try:
+                        self._stream.start()
+                    except Exception:
+                        self._recover_stream_locked()
+                else:
+                    self._open_input_stream()
+
+    @property
+    def is_paused(self) -> bool:
+        return self._is_paused
+
+    def _reset_state_silence(self):
         with self._lock:
-            self._is_paused = True
             self._state.is_beat = False
             self._state.is_hard_kick = False
             self._state.beat_strength = 0.0
@@ -280,55 +348,64 @@ class AudioBeatSyncEngine:
             self._state.smoothed_bands = np.zeros(4, dtype=np.float32)
             self._state.band_energies = np.zeros(4, dtype=np.float32)
             self._state.is_silent = True
-        if self._stream is not None:
+
+    def _recover_stream_locked(self):
+        """Closes any broken/stalled stream and re-opens audio capture."""
+        old = self._stream
+        self._stream = None
+        if old is not None:
             try:
-                self._stream.stop()
+                old.stop()
+                old.close()
+            except Exception:
+                pass
+        self._reset_state_silence()
+        prefer = self._preferred_device_index if self._preferred_device_index is not None else self.device_index
+        self.device_index, self.sample_rate = self._find_optimal_device_and_rate(prefer_device=prefer)
+        with self._lock:
+            self._setup_fft_bins()
+        if not self._open_input_stream():
+            # Refresh PortAudio's cached Windows device table if stream failed to reopen
+            try:
+                sd._terminate()
+                sd._initialize()
+                self.device_index, self.sample_rate = self._find_optimal_device_and_rate(prefer_device=prefer)
+                with self._lock:
+                    self._setup_fft_bins()
+                self._open_input_stream()
             except Exception:
                 pass
 
-    def resume(self):
-        """Resumes audio stream capture from paused state."""
-        with self._lock:
-            if not self._is_paused:
-                return
-            self._is_paused = False
-        if self._is_running:
-            if self._stream is not None:
-                try:
-                    self._stream.start()
-                except Exception:
-                    self.set_device(self.device_index)
-            else:
-                self.start()
-
-    @property
-    def is_paused(self) -> bool:
-        return self._is_paused
-
-    def _check_stream_health(self):
-        """Auto-recovers audio stream if disconnected or stopped unexpectedly."""
+    def recover_if_stalled(self):
+        """Public hook called on system resume / display wake to validate and restart stalled streams."""
         if not self._is_running or self._is_paused:
             return
-        now = time.time()
+        with self._stream_lock:
+            self._last_reconnect_time = 0.0
+            self._check_stream_health()
+
+    def _check_stream_health(self):
+        """Auto-recovers audio stream if disconnected, stopped, or stalled (no callbacks)."""
+        if not self._is_running or self._is_paused:
+            return
+        now = time.monotonic()
         if (now - self._last_reconnect_time) < 2.0:
             return
-        # If stream died or was invalidated (e.g. USB headset unplugged)
+        # If stream died, was invalidated, or WASAPI stopped delivering callbacks (stalled >2.5s)
         stream_dead = (self._stream is None) or (hasattr(self._stream, "active") and not self._stream.active)
-        if stream_dead:
-            self._last_reconnect_time = now
+        stream_stalled = (self._last_callback_time > 0.0) and ((now - self._last_callback_time) > 2.5)
+        if stream_dead or stream_stalled:
+            if not self._stream_lock.acquire(blocking=False):
+                return
             try:
-                # Attempt to restart or find fallback optimal device
-                self.device_index, self.sample_rate = self._find_optimal_device_and_rate(prefer_device=self.device_index)
-                if self._stream:
-                    try:
-                        self._stream.stop()
-                        self._stream.close()
-                    except Exception:
-                        pass
-                    self._stream = None
-                self.start()
+                if not self._is_running or self._is_paused:
+                    return
+                self._last_reconnect_time = now
+                self._recover_stream_locked()
             except Exception:
                 pass
+            finally:
+                self._stream_lock.release()
 
     def get_state(self) -> AudioBeatState:
         self._check_stream_health()
@@ -347,6 +424,7 @@ class AudioBeatSyncEngine:
 
     def _audio_callback(self, indata, frames, time_info, status):
         t0 = time.perf_counter()
+        self._last_callback_time = time.monotonic()
         if not self._is_running or self._is_paused:
             return
 
@@ -434,7 +512,7 @@ class AudioBeatSyncEngine:
         if len(self._energy_history) > self._history_len:
             self._energy_history.pop(0)
 
-        now = time.time()
+        now = time.monotonic()
         is_beat = False
         is_hard_kick = False
         beat_strength = 0.0
@@ -480,9 +558,10 @@ class AudioBeatSyncEngine:
             self._state.bpm_estimate = bpm
             self._state.latency_ms = lat_ms
             self._state.is_silent = False
+            beat_cbs = list(self._beat_callbacks) if is_beat else []
 
-        if is_beat:
-            for cb in self._beat_callbacks:
+        if is_beat and beat_cbs:
+            for cb in beat_cbs:
                 try:
                     cb(self._state)
                 except Exception:

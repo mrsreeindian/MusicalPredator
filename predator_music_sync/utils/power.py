@@ -24,6 +24,59 @@ class SYSTEM_POWER_STATUS(ctypes.Structure):
     ]
 
 
+class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [
+        ('Version', wintypes.ULONG),
+        ('ControlMask', wintypes.ULONG),
+        ('StateMask', wintypes.ULONG),
+    ]
+
+
+PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+PROCESS_POWER_THROTTLING_INFORMATION = 4
+
+
+def set_process_power_throttling(disable_throttling: bool = True) -> bool:
+    """
+    Opts the current process in or out of Windows 10/11 EcoQoS background throttling
+    and timer resolution throttling (which Windows applies when all GUI windows are
+    hidden/withdrawn to the system tray).
+
+    When disable_throttling=True, sets ControlMask to EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION
+    with StateMask=0 so 60 FPS background audio/LED sync and 1ms timers remain active in tray.
+    When disable_throttling=False, clears ControlMask/StateMask to restore OS defaults.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        k32.SetProcessInformation.restype = wintypes.BOOL
+
+        mask = (
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        ) if disable_throttling else 0
+        state = PROCESS_POWER_THROTTLING_STATE(
+            Version=PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask=mask,
+            StateMask=0,
+        )
+        return bool(
+            k32.SetProcessInformation(
+                k32.GetCurrentProcess(),
+                PROCESS_POWER_THROTTLING_INFORMATION,
+                ctypes.byref(state),
+                ctypes.sizeof(state),
+            )
+        )
+    except Exception:
+        return False
+
+
 class PowerStatus:
     """Immutable snapshot of the system's power and battery state."""
 
@@ -97,7 +150,8 @@ class PowerMonitor:
         poll_interval: float = 1.5,
         on_ac_power_change: Optional[Callable[[bool], None]] = None,
         on_battery_saver_change: Optional[Callable[[bool], None]] = None,
-        on_battery_percent_change: Optional[Callable[[int], None]] = None
+        on_battery_percent_change: Optional[Callable[[int], None]] = None,
+        on_system_resume: Optional[Callable[[], None]] = None,
     ):
         self.poll_interval = max(0.5, float(poll_interval))
 
@@ -117,8 +171,17 @@ class PowerMonitor:
         if on_battery_percent_change:
             self._percent_callbacks.append(on_battery_percent_change)
 
+        self._resume_callbacks: List[Callable[[], None]] = []
+        if on_system_resume:
+            self._resume_callbacks.append(on_system_resume)
+
         self._last_status: Optional[PowerStatus] = None
         self._mock_status: Optional[PowerStatus] = None
+
+    def add_resume_callback(self, cb: Callable[[], None]):
+        with self._lock:
+            if cb not in self._resume_callbacks:
+                self._resume_callbacks.append(cb)
 
     def add_ac_power_callback(self, cb: Callable[[bool], None]):
         with self._lock:
@@ -205,7 +268,18 @@ class PowerMonitor:
             if threading.current_thread() != self._thread:
                 self._thread.join(timeout=0.5)
 
+    def _notify_resume(self):
+        with self._lock:
+            cbs = list(self._resume_callbacks)
+        for cb in cbs:
+            try:
+                cb()
+            except Exception:
+                pass
+
     def _monitor_loop(self):
+        prev_mono = time.monotonic()
+        prev_wall = time.time()
         while True:
             with self._lock:
                 if not self._running:
@@ -219,6 +293,17 @@ class PowerMonitor:
                 with self._lock:
                     if not self._running:
                         return
+
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            mono_elapsed = now_mono - prev_mono
+            wall_elapsed = now_wall - prev_wall
+            prev_mono = now_mono
+            prev_wall = now_wall
+
+            # Detect S3 sleep / Modern Standby resume via monotonic jump or wall-clock drift
+            if mono_elapsed > max(5.0, interval * 3.0) or abs(wall_elapsed - mono_elapsed) > 4.0:
+                self._notify_resume()
 
             status = self.get_status()
             self._evaluate_state(status)
