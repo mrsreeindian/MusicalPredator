@@ -38,6 +38,9 @@ class VirtualKeyboardBackend(KeyboardControllerBase):
         self.sync_auxiliary: bool = True
         self.devices: List[Dict[str, Any]] = []
         self.primary_led_count: int = self.model_info.zone_count
+        self._unscaled_colors: List[Tuple[int, int, int]] = [(0, 0, 0)] * self.NUM_ZONES
+        self._last_is_beat: bool = False
+        self._device_led_colors: Dict[int, List[Tuple[int, int, int]]] = {}
         self.refresh_devices()
 
     def refresh_devices(self):
@@ -68,6 +71,47 @@ class VirtualKeyboardBackend(KeyboardControllerBase):
                 "is_per_key": False
             })
         self.primary_led_count = kb_zones
+        self._recompute_scaled_outputs()
+
+    @property
+    def brightness(self) -> int:
+        return self._brightness
+
+    @brightness.setter
+    def brightness(self, value: int):
+        val = max(0, min(100, int(value)))
+        if val != self._brightness:
+            self._brightness = val
+            self._recompute_scaled_outputs()
+            if self._on_update:
+                self._on_update(list(self._current_colors))
+
+    def _recompute_scaled_outputs(self):
+        """Recomputes scaled 4-zone colors and expanded per-device LED arrays."""
+        scale = self._brightness / 100.0
+        scaled = [
+            (
+                int(max(0, min(255, round(max(0, min(255, r)) * scale)))),
+                int(max(0, min(255, round(max(0, min(255, g)) * scale)))),
+                int(max(0, min(255, round(max(0, min(255, b)) * scale)))),
+            )
+            for r, g, b in self._unscaled_colors[:self.NUM_ZONES]
+        ]
+        self._current_colors = scaled
+
+        kb_zones = self.model_info.zone_count if self.model_info else self.primary_led_count
+        self._device_led_colors[0] = map_4zone_to_n(scaled, kb_zones)
+        if self.sync_auxiliary and len(self.devices) > 1:
+            for dev in self.devices[1:]:
+                idx = dev["index"]
+                cnt = dev.get("led_count", 1)
+                self._device_led_colors[idx] = map_auxiliary_device_colors(
+                    scaled, cnt, is_beat=self._last_is_beat
+                )
+
+    def get_device_led_colors(self, device_index: int = 0) -> List[Tuple[int, int, int]]:
+        """Returns the latest scaled per-LED colors for the requested simulated device."""
+        return list(self._device_led_colors.get(device_index, []))
 
     @property
     def frame_count(self) -> int:
@@ -85,11 +129,13 @@ class VirtualKeyboardBackend(KeyboardControllerBase):
     def set_zone_color(self, zone: int, r: int, g: int, b: int) -> bool:
         t0 = time.perf_counter()
         if 0 <= zone < self.NUM_ZONES:
-            scale = self._brightness / 100.0
-            r_scaled = int(max(0, min(255, r)) * scale)
-            g_scaled = int(max(0, min(255, g)) * scale)
-            b_scaled = int(max(0, min(255, b)) * scale)
-            self._current_colors[zone] = (r_scaled, g_scaled, b_scaled)
+            self._unscaled_colors[zone] = (
+                int(max(0, min(255, r))),
+                int(max(0, min(255, g))),
+                int(max(0, min(255, b))),
+            )
+            self._last_is_beat = False
+            self._recompute_scaled_outputs()
             self._frame_count += 1
             if self._on_update:
                 self._on_update(list(self._current_colors))
@@ -101,14 +147,19 @@ class VirtualKeyboardBackend(KeyboardControllerBase):
         return False
 
     def set_all_zones(self, colors: List[Tuple[int, int, int]], is_beat: bool = False, sync: bool = False, **kwargs) -> bool:
+        if len(colors) < self.NUM_ZONES:
+            return False
         t0 = time.perf_counter()
-        scale = self._brightness / 100.0
-        for i in range(min(self.NUM_ZONES, len(colors))):
-            r, g, b = colors[i]
-            r_scaled = int(max(0, min(255, r)) * scale)
-            g_scaled = int(max(0, min(255, g)) * scale)
-            b_scaled = int(max(0, min(255, b)) * scale)
-            self._current_colors[i] = (r_scaled, g_scaled, b_scaled)
+        self._unscaled_colors = [
+            (
+                int(max(0, min(255, c[0]))),
+                int(max(0, min(255, c[1]))),
+                int(max(0, min(255, c[2]))),
+            )
+            for c in colors[:self.NUM_ZONES]
+        ]
+        self._last_is_beat = bool(is_beat) and not bool(kwargs.get("is_static", False))
+        self._recompute_scaled_outputs()
         self._frame_count += 1
         if self._on_update:
             self._on_update(list(self._current_colors))
