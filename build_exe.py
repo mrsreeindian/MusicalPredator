@@ -2,7 +2,7 @@
 Build Script for MusicalPredator Standalone Application & Installer
 1. Compiles standalone application: 'dist/MusicalPredator.exe'
 2. Compiles standalone Windows Installer: 'dist/MusicalPredator-Setup.exe'
-3. Creates distribution package folder and 'dist/MusicalPredator-v1.0.0-Windows-x64.zip'
+3. Creates distribution package folder and 'dist/MusicalPredator-v1.1.0-Windows-x64.zip'
 """
 
 import os
@@ -11,6 +11,11 @@ import shutil
 import zipfile
 import subprocess
 import PyInstaller.__main__
+
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from predator_music_sync import __version__ as APP_VERSION
 
 def build():
     print("=" * 80)
@@ -142,7 +147,7 @@ def build():
     print("STAGE 3: Assembling Distribution Package & ZIP Archive")
     print("-" * 80)
 
-    package_dir = os.path.join(project_root, "dist", "MusicalPredator-v1.0.0-Windows-x64")
+    package_dir = os.path.join(project_root, "dist", f"MusicalPredator-v{APP_VERSION}-Windows-x64")
     if os.path.exists(package_dir):
         shutil.rmtree(package_dir)
     os.makedirs(package_dir, exist_ok=True)
@@ -206,8 +211,8 @@ exit
         f.write(setup_bat)
 
     # README
-    readme = """===============================================================================
-MUSICALPREDATOR (v1.0.0)
+    readme = f"""===============================================================================
+MUSICALPREDATOR (v{APP_VERSION})
 Hardware Optimized for Acer Predator Helios Neo 16 (PHN16-71) 4-Zone RGB
 ===============================================================================
 
@@ -226,23 +231,24 @@ FEATURES:
 - Pure Black Industrial Aesthetic (Predator Minimalist Style)
 - Real-time 60 FPS Audio-Reactive Keyboard Illumination (Sub-Bass, Low-Mid, High-Mid, Treble)
 - Zero-Elevation Physical ACPI EC Named Pipe Driver (No Admin Privileges Required)
-- Windows System Tray Integration (Double-click to open, close minimizes to tray)
-- 12 Audio-Reactive Animation Algorithms (Dynamic Studio EQ, Bass Drop Strobe, Aurora, etc.)
-- Static Album Art Mode & Windows SMTC Media Integration
+- Bidirectional Physical EC Keyboard Brightness Control & Fn+F9 / Fn+F10 Hotkey Sync
+- Windows System Tray Integration (Double-click to open, close minimizes to tray, long-running tray resilience)
+- 14 Lighting Modes (12 Audio-Reactive Algorithms + 2 Static Album Art Modes)
+- Built-in In-App GitHub Releases Updater (Portable & Silent Setup Upgrades)
 - Per-Monitor V2 DPI Awareness (Clean, razor-sharp rendering at 125% & 150% scaling)
 - Ultra-Low Idle Resource Usage (~0.1% CPU when minimized and during silence)
 - Start on Boot Registry Integration
 
 REQUIREMENTS:
 - Windows 10 or Windows 11 (64-bit)
-- Acer Predator Helios Neo 16 or compatible 4-Zone Acer RGB laptop
+- Acer Predator Helios Neo 16 or compatible 4-Zone / Per-Key Acer RGB laptop
 - Acer Lighting Service running in background (standard Acer OEM pre-install)
 """
     with open(os.path.join(package_dir, "README.txt"), "w", encoding="utf-8") as f:
         f.write(readme)
 
     # ZIP Package
-    zip_path = os.path.join(project_root, "dist", "MusicalPredator-v1.0.0-Windows-x64.zip")
+    zip_path = os.path.join(project_root, "dist", f"MusicalPredator-v{APP_VERSION}-Windows-x64.zip")
     print(f"[*] Packaging ZIP archive: {zip_path}...")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for root, dirs, files in os.walk(package_dir):

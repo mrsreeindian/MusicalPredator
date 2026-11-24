@@ -1,6 +1,6 @@
 # MusicalPredator
 
-[![Release](https://img.shields.io/badge/Release-v1.0.0-blue.svg)](https://github.com/mrsreeindian/MusicalPredator/releases/tag/v1.0.0)
+[![Release](https://img.shields.io/badge/Release-v1.1.0-blue.svg)](https://github.com/mrsreeindian/MusicalPredator/releases/tag/v1.1.0)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011%20(64--bit)-lightgrey.svg)](https://www.microsoft.com/windows)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -43,11 +43,18 @@
   - **Dynamic Audio Reactive**: Spectrum Equalizer, EDM Strobe, Ripple Wave, Scanner, Beat Pulse, Smooth Wave, Cyberpunk Shift, Plasma Vortex, Dual Split, Aurora Borealis, Firefly, Starlight Sparkle.
   - **Static & Ambient**: Static Album Art (steady underglow matched to album artwork) and Static Album Dominant (pure unified album glow).
 
-- **Windows Notification Area Tray Suite**:
-  - Runs quietly in the system notification tray.
-  - Right-click tray menu for instant mode switching, brightness adjustment, and pause controls.
-  - High-DPI responsive dashboard with live 98-key virtual keyboard mirror and real-time 4-band audio EQ visualizer.
+- **Physical EC Keyboard Brightness & Hotkey Sync**:
+  - Direct Embedded Controller (EC) brightness control via `\\.\pipe\AcerLightingService_NamedPipe` with anti-double-dimming RGB scaling.
+  - Bidirectional `Fn+F9` / `Fn+F10` physical hotkey sync keeping the GUI slider, `EC SYNC` indicator badge, and tray **Brightness** submenu (`0%`–`100%`) aligned.
+
+- **Windows Notification Area Tray Suite & Sleep/Resume Resilience**:
+  - Runs reliably in the system notification tray with EcoQoS throttling opt-out, `WM_POWERBROADCAST` sleep/resume recovery, `PeekNamedPipe` health checks, and stalled WASAPI stream recovery.
+  - Right-click tray menu for instant mode switching, EC brightness presets, pause controls, and **Check for Updates...**.
+  - High-DPI responsive dashboard with hardware-accurate stepped 4-zone / 3-zone / Per-Key virtual keyboard mirror (full 6-row numpad), real-time 4-band audio EQ visualizer, and smooth 60 FPS projection.
   - Optional **Start on Windows Boot** autostart integration.
+
+- **Built-In In-App Updater**:
+  - Checks GitHub Releases (`mrsreeindian/MusicalPredator`) using SemVer 2.0.0 comparison, streaming progress, PE `MZ` & SHA-256 verification, and detached post-exit self-updating for both Portable EXE and silent Installed Setup upgrades.
 
 ---
 
@@ -69,17 +76,17 @@ MusicalPredator automatically detects and configures itself for your laptop mode
 ## Installation
 
 ### Option 1: Standalone Installer (Recommended)
-1. Download **`MusicalPredator-Setup.exe`** from the [Latest Release](https://github.com/mrsreeindian/MusicalPredator/releases/tag/v1.0.0).
+1. Download **`MusicalPredator-Setup.exe`** from the [Latest Release](https://github.com/mrsreeindian/MusicalPredator/releases/tag/v1.1.0).
 2. Run the wizard to install to `%LOCALAPPDATA%\Programs\MusicalPredator`.
 3. Choose desktop shortcuts and Windows startup preferences, then click **Finish**.
 
 ### Option 2: Portable Executable
-1. Download **`MusicalPredator.exe`** from the [Latest Release](https://github.com/mrsreeindian/MusicalPredator/releases/tag/v1.0.0).
+1. Download **`MusicalPredator.exe`** from the [Latest Release](https://github.com/mrsreeindian/MusicalPredator/releases/tag/v1.1.0).
 2. Place the executable in any folder and run directly.
 
 ### Option 3: Full Release Archive
-1. Download **`MusicalPredator-v1.0.0-Windows-x64.zip`**.
-2. Extract to your desired location and launch `start_app.bat` or `MusicalPredator.exe`.
+1. Download **`MusicalPredator-v1.1.0-Windows-x64.zip`**.
+2. Extract to your desired location and launch `Setup-MusicalPredator.bat` or `MusicalPredator.exe`.
 
 ---
 
@@ -110,8 +117,12 @@ python run_app.pyw --minimized
 
 ### Running Tests and Benchmarks
 ```powershell
-# Run the full 8-part integration and hardware compatibility test suite
+# Run all 5 automated test & verification suites
 python test_component_audit.py
+python test_tray_longevity.py
+python test_keyboard_projection.py
+python test_physical_brightness.py
+python test_updater.py
 
 # Run hardware latency and pipe roundtrip benchmark
 python run_benchmark.py
@@ -124,7 +135,7 @@ python build_exe.py
 Outputs generated in `dist/`:
 - `dist/MusicalPredator-Setup.exe`: Standalone GUI setup wizard
 - `dist/MusicalPredator.exe`: Standalone portable binary
-- `dist/MusicalPredator-v1.0.0-Windows-x64.zip`: Complete distribution package
+- `dist/MusicalPredator-v1.1.0-Windows-x64.zip`: Complete distribution package
 
 ---
 
@@ -145,14 +156,18 @@ If the keyboard does not react or AcerLightingService enters a stale state:
 ├── predator_music_sync/     # Core application source
 │   ├── benchmark/           # Hardware roundtrip latency benchmark runner
 │   ├── core/                # FFT audio analysis, beat detection, and animations
-│   ├── gui/                 # Sleek dark-mode dashboard with physical keycap mirror
-│   ├── hardware/            # Named pipe driver, model detector, and ACPI layer
+│   ├── gui/                 # Sleek dark-mode dashboard, keyboard mirror & update dialog
+│   ├── hardware/            # Named pipe driver, EC brightness, model detector, and ACPI layer
 │   ├── service/             # Dedicated 60 FPS background sync thread
 │   ├── tray/                # Windows notification area system tray manager
-│   └── utils/               # Windows registry, power status, and autostart utils
+│   └── utils/               # Windows registry, power throttling, autostart & GitHub updater
 ├── build_exe.py             # Release packager & binary compiler
 ├── requirements.txt         # Production dependencies
-└── test_component_audit.py  # Comprehensive test and verification suite
+├── test_component_audit.py  # Core component integration & hardware audit suite
+├── test_tray_longevity.py   # Long-running tray, EcoQoS, pipe & SMTC resilience tests
+├── test_keyboard_projection.py # Keyboard layout, zone alignment & animation fidelity tests
+├── test_physical_brightness.py # EC brightness & Fn+F9/F10 sync tests
+└── test_updater.py          # GitHub Releases updater & silent upgrade tests
 ```
 
 ---

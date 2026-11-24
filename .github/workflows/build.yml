@@ -26,9 +26,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Component Audit & Verification Tests
+      - name: Run Verification & Audit Test Suites
         run: |
           python test_component_audit.py
+          python test_tray_longevity.py
+          python test_keyboard_projection.py
+          python test_physical_brightness.py
+          python test_updater.py
 
       - name: Build Standalone Application & Setup Wizard
         run: |
@@ -41,16 +45,18 @@ jobs:
           path: |
             dist/MusicalPredator-Setup.exe
             dist/MusicalPredator.exe
-            dist/MusicalPredator-v1.0.0-Windows-x64.zip
+            dist/MusicalPredator-v1.1.0-Windows-x64.zip
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          name: MusicalPredator ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
           files: |
             dist/MusicalPredator-Setup.exe
             dist/MusicalPredator.exe
-            dist/MusicalPredator-v1.0.0-Windows-x64.zip
+            dist/MusicalPredator-v1.1.0-Windows-x64.zip
           draft: false
           prerelease: false
         env:
