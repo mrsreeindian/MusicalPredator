@@ -192,6 +192,24 @@ class TestTrayLongevityFixes(unittest.TestCase):
             engine.stop_monitoring()
             self.assertLess(time.perf_counter() - t0, 0.5)
 
+        # Live Windows verification: persistent PowerShell worker responds without timing out
+        if sys.platform == "win32":
+            try:
+                res1 = engine._query_windows_smtc_persistent()
+                self.assertIsNotNone(engine._ps_proc, "Persistent PS worker should remain alive after query 1")
+                self.assertIsNone(engine._ps_proc.poll(), "Persistent PS worker process exited unexpectedly")
+                self.assertEqual(engine._ps_query_count, 1)
+
+                res2 = engine._query_windows_smtc_persistent()
+                self.assertIsNotNone(engine._ps_proc, "Persistent PS worker should remain alive after query 2")
+                self.assertIsNone(engine._ps_proc.poll())
+                self.assertEqual(engine._ps_query_count, 2)
+                # Ensure parsed result (if media is playing) or None (if NoSession) is valid
+                self.assertTrue(res1 is None or isinstance(res1, MediaTrackInfo))
+                self.assertTrue(res2 is None or isinstance(res2, MediaTrackInfo))
+            finally:
+                engine._stop_ps_worker()
+
     def test_05_sync_service_resume_and_disabled_lighting_guard(self):
         service = PredatorSyncService(target_fps=60, prefer_virtual=True)
         try:

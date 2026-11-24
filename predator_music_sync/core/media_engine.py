@@ -67,10 +67,11 @@ class MediaSessionEngine:
         os.makedirs(self.cache_dir, exist_ok=True)
 
         self._ps_script_path = os.path.join(self.cache_dir, "get_smtc_media.ps1")
+        self._ps_worker_script_path = os.path.join(self.cache_dir, "get_smtc_media_worker.ps1")
         self._ensure_ps_script()
 
     def _ensure_ps_script(self):
-        """Create the optimized PowerShell SMTC extraction script."""
+        """Create the optimized PowerShell SMTC extraction scripts (one-shot and persistent worker)."""
         script_content = r"""Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
     $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' 
@@ -113,11 +114,62 @@ try {
         '{"NoSession": true}'
     }
 } catch {
-    '{"Error": "' + $_.Exception.Message.Replace('"', '\"') + '"}'
+    @{ Error = $_.Exception.Message } | ConvertTo-Json -Compress
 }
 """
         with open(self._ps_script_path, "w", encoding="utf-8") as f:
             f.write(script_content)
+
+        worker_script_content = r"""Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+}
+function AwaitOp($op, $type) {
+    $m = $asTaskGeneric.MakeGenericMethod($type)
+    $t = $m.Invoke($null, @($op))
+    $t.Wait()
+    return $t.Result
+}
+while (($targetDir = [Console]::In.ReadLine()) -ne $null) {
+    if ($targetDir -eq '__EXIT__') { break }
+    try {
+        $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media, ContentType = WindowsRuntime]::RequestAsync()
+        $mgr = AwaitOp $asyncOp ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
+        $session = $mgr.GetCurrentSession()
+        if ($session) {
+            $props = AwaitOp ($session.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
+            $outObj = @{
+                Title = $props.Title
+                Artist = $props.Artist
+                AlbumTitle = $props.AlbumTitle
+                HasThumbnail = ($props.Thumbnail -ne $null)
+            }
+            if ($props.Thumbnail -and $targetDir) {
+                $stream = AwaitOp ($props.Thumbnail.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
+                $asStreamMethod = [System.IO.WindowsRuntimeStreamExtensions].GetMethod("AsStream", [Type[]]@([Windows.Storage.Streams.IRandomAccessStream]))
+                if ($asStreamMethod) {
+                    $netStream = $asStreamMethod.Invoke($null, @($stream))
+                    $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($props.Title + $props.Artist))).Replace('-', '')
+                    $outFile = [System.IO.Path]::Combine($targetDir, "cover_" + $hash + ".jpg")
+                    $fileStream = [System.IO.File]::Create($outFile)
+                    $netStream.CopyTo($fileStream)
+                    $fileStream.Close()
+                    $netStream.Close()
+                    $outObj["SavedPath"] = $outFile
+                }
+            }
+            [Console]::Out.WriteLine(($outObj | ConvertTo-Json -Compress))
+        } else {
+            [Console]::Out.WriteLine('{"NoSession": true}')
+        }
+    } catch {
+        [Console]::Out.WriteLine((@{ Error = $_.Exception.Message } | ConvertTo-Json -Compress))
+    }
+    [Console]::Out.Flush()
+}
+"""
+        with open(self._ps_worker_script_path, "w", encoding="utf-8") as f:
+            f.write(worker_script_content)
 
     def add_track_change_callback(self, callback: Callable[[MediaTrackInfo], None]):
         self._on_track_change_callbacks.append(callback)
@@ -218,63 +270,20 @@ try {
             self._query_lock.release()
 
     def _start_ps_worker(self) -> bool:
-        """Starts a persistent hidden PowerShell SMTC worker to avoid spawning processes every 2s."""
+        """Starts a persistent hidden PowerShell SMTC worker via -File so stdin stays dedicated to query lines."""
         if sys.platform != "win32":
             return False
         self._stop_ps_worker()
-        loop_script = r"""
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$asTaskGeneric = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-}
-function AwaitOp($op, $type) {
-    $m = $asTaskGeneric.MakeGenericMethod($type)
-    $t = $m.Invoke($null, @($op))
-    $t.Wait()
-    return $t.Result
-}
-while (($targetDir = [Console]::In.ReadLine()) -ne $null) {
-    if ($targetDir -eq '__EXIT__') { break }
-    try {
-        $asyncOp = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media, ContentType = WindowsRuntime]::RequestAsync()
-        $mgr = AwaitOp $asyncOp ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
-        $session = $mgr.GetCurrentSession()
-        if ($session) {
-            $props = AwaitOp ($session.TryGetMediaPropertiesAsync()) ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties])
-            $outObj = @{
-                Title = $props.Title
-                Artist = $props.Artist
-                AlbumTitle = $props.AlbumTitle
-                HasThumbnail = ($props.Thumbnail -ne $null)
-            }
-            if ($props.Thumbnail -and $targetDir) {
-                $stream = AwaitOp ($props.Thumbnail.OpenReadAsync()) ([Windows.Storage.Streams.IRandomAccessStreamWithContentType])
-                $asStreamMethod = [System.IO.WindowsRuntimeStreamExtensions].GetMethod("AsStream", [Type[]]@([Windows.Storage.Streams.IRandomAccessStream]))
-                if ($asStreamMethod) {
-                    $netStream = $asStreamMethod.Invoke($null, @($stream))
-                    $hash = [BitConverter]::ToString([System.Security.Cryptography.MD5]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($props.Title + $props.Artist))).Replace('-', '')
-                    $outFile = [System.IO.Path]::Combine($targetDir, "cover_" + $hash + ".jpg")
-                    $fileStream = [System.IO.File]::Create($outFile)
-                    $netStream.CopyTo($fileStream)
-                    $fileStream.Close()
-                    $netStream.Close()
-                    $outObj["SavedPath"] = $outFile
-                }
-            }
-            [Console]::Out.WriteLine(($outObj | ConvertTo-Json -Compress))
-        } else {
-            [Console]::Out.WriteLine('{"NoSession": true}')
-        }
-    } catch {
-        $msg = $_.Exception.Message.Replace('"', '\"').Replace("`r", " ").Replace("`n", " ")
-        [Console]::Out.WriteLine(('{"Error": "' + $msg + '"}'))
-    }
-    [Console]::Out.Flush()
-}
-"""
         try:
             proc = subprocess.Popen(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    self._ps_worker_script_path,
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -303,9 +312,6 @@ while (($targetDir = [Console]::In.ReadLine()) -ne $null) {
 
             t = threading.Thread(target=_reader, daemon=True, name="SMTCPowerShellReader")
             t.start()
-            if proc.stdin is not None:
-                proc.stdin.write(loop_script + "\n")
-                proc.stdin.flush()
             self._ps_proc = proc
             self._ps_stdout_queue = q
             self._ps_query_count = 0
@@ -366,8 +372,9 @@ while (($targetDir = [Console]::In.ReadLine()) -ne $null) {
                     break
             self._ps_proc.stdin.write(self.cache_dir + "\n")
             self._ps_proc.stdin.flush()
+            timeout = 4.0 if self._ps_query_count == 0 else 2.5
             self._ps_query_count += 1
-            line = self._ps_stdout_queue.get(timeout=2.5)
+            line = self._ps_stdout_queue.get(timeout=timeout)
             if line is None:
                 self._stop_ps_worker()
                 return None
