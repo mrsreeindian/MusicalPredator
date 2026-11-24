@@ -13,8 +13,16 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Optional
+from typing import Dict, Optional, Sequence
 from PIL import Image, ImageTk, ImageDraw
+
+try:
+    _ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _ROOT_DIR not in sys.path:
+        sys.path.insert(0, _ROOT_DIR)
+    from predator_music_sync import __version__ as APP_VERSION
+except Exception:
+    APP_VERSION = "1.1.0"
 
 
 # Theme Palette (MusicalPredator Dark Aesthetic)
@@ -72,6 +80,269 @@ def get_payload_paths():
             break
 
     return exe_path, assets_path
+
+
+def get_existing_install_dir() -> Optional[str]:
+    """Reads existing InstallLocation from HKCU Uninstall registry if present."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+        uninstall_key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\MusicalPredator"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, uninstall_key, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, "InstallLocation")
+            if val and os.path.isdir(str(val).strip()):
+                return os.path.normpath(str(val).strip())
+    except Exception:
+        pass
+    return None
+
+
+def _is_autostart_registered() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+        run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, "MusicalPredator")
+            return bool(val)
+    except Exception:
+        return False
+
+
+def _copy_with_retry(src: str, dst: str, retries: int = 10, delay: float = 0.5) -> None:
+    """Copies payload binary with retry in case previous process is still releasing locks."""
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            shutil.copy2(src, dst)
+            return
+        except PermissionError as exc:
+            last_err = exc
+            if attempt == 2:
+                try:
+                    subprocess.run(["taskkill", "/F", "/IM", "MusicalPredator.exe"], capture_output=True)
+                    subprocess.run(["taskkill", "/F", "/IM", "PredatorSync.exe"], capture_output=True)
+                except Exception:
+                    pass
+            time.sleep(delay)
+    if last_err is not None:
+        raise last_err
+
+
+def _create_shortcut(shortcut_name: str, folder: str, target: str, work_dir: str, icon: str = "", desc: str = ""):
+    """Creates a Windows .lnk shortcut using temporary VBScript execution."""
+    os.makedirs(folder, exist_ok=True)
+    lnk_path = os.path.join(folder, shortcut_name)
+    vbs_script = f"""
+Set WshShell = CreateObject("WScript.Shell")
+Set oShortcut = WshShell.CreateShortcut("{lnk_path.replace('\\', '\\\\')}")
+oShortcut.TargetPath = "{target.replace('\\', '\\\\')}"
+oShortcut.WorkingDirectory = "{work_dir.replace('\\', '\\\\')}"
+oShortcut.Description = "{desc}"
+"""
+    if icon:
+        vbs_script += f'oShortcut.IconLocation = "{icon.replace("\\", "\\\\")}"\n'
+    vbs_script += "oShortcut.Save\n"
+
+    subprocess.run(["cscript", "//nologo", "/E:VBScript"], input=vbs_script, text=True, capture_output=True)
+
+
+def _create_uninstaller(install_dir: str):
+    """Creates clean uninstallation scripts."""
+    uninst_bat_path = os.path.join(install_dir, "uninstall.bat")
+    bat_content = f"""@echo off
+title MusicalPredator Uninstaller
+echo ======================================================================
+echo Uninstalling MusicalPredator...
+echo ======================================================================
+
+:: Kill running instances
+taskkill /F /IM MusicalPredator.exe >nul 2>&1
+taskkill /F /IM PredatorSync.exe >nul 2>&1
+
+:: Remove Autostart Key
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "MusicalPredator" /f >nul 2>&1
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "PredatorMusicSync" /f >nul 2>&1
+
+:: Remove Uninstall Registration Key
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MusicalPredator" /f >nul 2>&1
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PredatorSync" /f >nul 2>&1
+
+:: Remove Shortcuts
+del /Q "%USERPROFILE%\\Desktop\\MusicalPredator.lnk" >nul 2>&1
+del /Q "%USERPROFILE%\\Desktop\\Predator Keyboard Sync.lnk" >nul 2>&1
+rd /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\MusicalPredator" >nul 2>&1
+rd /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Predator Sync" >nul 2>&1
+
+:: Delete installation files (self-deleting batch)
+start /b "" cmd /c timeout /t 1 /nobreak ^>nul ^& rd /S /Q "{install_dir}"
+echo.
+echo Uninstallation Complete.
+if "%1"=="" pause
+exit
+"""
+    with open(uninst_bat_path, "w", encoding="utf-8") as f:
+        f.write(bat_content)
+
+
+def _register_uninstall_entry(install_dir: str, exe_path: str, ico_path: str):
+    """Registers the application in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MusicalPredator."""
+    try:
+        import winreg
+        uninstall_key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\MusicalPredator"
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, uninstall_key, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "MusicalPredator")
+            winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, APP_VERSION)
+            winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "Predator Community")
+            winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, install_dir)
+            if os.path.exists(ico_path):
+                winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, ico_path)
+            winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, f'cmd.exe /c "{os.path.join(install_dir, "uninstall.bat")}"')
+            winreg.SetValueEx(key, "QuietUninstallString", 0, winreg.REG_SZ, f'cmd.exe /c "{os.path.join(install_dir, "uninstall.bat")} /quiet"')
+            winreg.SetValueEx(key, "EstimatedSize", 0, winreg.REG_DWORD, 36000)
+            winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
+    except Exception as e:
+        print(f"Warning: Failed to write uninstall registry: {e}")
+
+
+def _configure_autostart(exe_path: str):
+    """Registers start on boot in HKCU Run."""
+    try:
+        import winreg
+        run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        cmd = f'"{exe_path}" --minimized'
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "MusicalPredator", 0, winreg.REG_SZ, cmd)
+    except Exception as e:
+        print(f"Warning: Failed to set autostart: {e}")
+
+
+def perform_installation(
+    install_dir: str,
+    create_desktop_shortcut: bool = True,
+    create_start_shortcut: bool = True,
+    enable_autostart: bool = True,
+    progress_cb=None,
+) -> str:
+    """Performs the actual installation or in-place upgrade and returns installed MusicalPredator.exe path."""
+    def _report(pct: float, msg: str):
+        if progress_cb:
+            progress_cb(pct, msg)
+
+    target_dir = os.path.normpath(install_dir)
+    _report(10, f"Creating destination directory: {target_dir}")
+    os.makedirs(target_dir, exist_ok=True)
+
+    _report(20, "Checking running processes...")
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "MusicalPredator.exe"], capture_output=True)
+        subprocess.run(["taskkill", "/F", "/IM", "PredatorSync.exe"], capture_output=True)
+    except Exception:
+        pass
+
+    exe_src, assets_src = get_payload_paths()
+    if not exe_src or not os.path.exists(exe_src):
+        raise RuntimeError("MusicalPredator.exe payload not found in installer package.")
+
+    _report(40, "Copying MusicalPredator.exe binary...")
+    target_exe = os.path.join(target_dir, "MusicalPredator.exe")
+    _copy_with_retry(exe_src, target_exe)
+
+    if assets_src and os.path.isdir(assets_src):
+        _report(55, "Copying application assets and icons...")
+        target_assets = os.path.join(target_dir, "assets")
+        if os.path.exists(target_assets):
+            shutil.rmtree(target_assets)
+        shutil.copytree(assets_src, target_assets)
+
+    target_ico = os.path.join(target_dir, "assets", "predator_icon.ico")
+    icon_loc = f"{target_ico}, 0" if os.path.exists(target_ico) else ""
+
+    if create_desktop_shortcut:
+        _report(70, "Creating Desktop shortcut...")
+        _create_shortcut(
+            shortcut_name="MusicalPredator.lnk",
+            folder=os.path.expanduser(r"~\Desktop"),
+            target=target_exe,
+            work_dir=target_dir,
+            icon=icon_loc,
+            desc="Acer Predator Helios Neo 16 4-Zone RGB Music Sync"
+        )
+
+    if create_start_shortcut:
+        _report(80, "Creating Start Menu shortcuts...")
+        start_dir = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\MusicalPredator")
+        os.makedirs(start_dir, exist_ok=True)
+        _create_shortcut(
+            shortcut_name="MusicalPredator.lnk",
+            folder=start_dir,
+            target=target_exe,
+            work_dir=target_dir,
+            icon=icon_loc,
+            desc="Acer Predator Helios Neo 16 4-Zone RGB Music Sync"
+        )
+
+    _report(85, "Creating uninstaller...")
+    _create_uninstaller(target_dir)
+
+    _report(90, "Registering in Windows Installed Apps...")
+    _register_uninstall_entry(target_dir, target_exe, target_ico)
+
+    if enable_autostart:
+        _report(95, "Configuring Start on Windows Boot...")
+        _configure_autostart(target_exe)
+
+    _report(100, "Installation completed successfully!")
+    return target_exe
+
+
+def parse_installer_args(argv: Sequence[str]) -> Dict[str, object]:
+    """Parses CLI flags for unattended/silent updates (--silent, --dir=..., --launch, --minimized)."""
+    opts: Dict[str, object] = {
+        "silent": False,
+        "install_dir": None,
+        "launch": False,
+        "minimized": False,
+    }
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        low = arg.lower()
+        if low in ("--silent", "/s", "-s", "--unattended"):
+            opts["silent"] = True
+        elif low == "--launch":
+            opts["launch"] = True
+        elif low == "--minimized":
+            opts["minimized"] = True
+        elif low.startswith("--dir="):
+            opts["install_dir"] = os.path.normpath(arg.split("=", 1)[1].strip('"'))
+        elif low == "--dir" and i + 1 < len(args):
+            opts["install_dir"] = os.path.normpath(args[i + 1].strip('"'))
+            i += 1
+        i += 1
+    return opts
+
+
+def run_silent_install(opts: Dict[str, object]) -> int:
+    """Runs an unattended in-place installation/upgrade and optionally launches MusicalPredator.exe."""
+    install_dir = opts.get("install_dir") or get_existing_install_dir() or get_default_install_dir()
+    preserve_autostart = _is_autostart_registered()
+    target_exe = perform_installation(
+        install_dir=str(install_dir),
+        create_desktop_shortcut=False,
+        create_start_shortcut=True,
+        enable_autostart=preserve_autostart,
+    )
+    if opts.get("launch") and os.path.exists(target_exe):
+        launch_cmd = [target_exe]
+        if opts.get("minimized"):
+            launch_cmd.append("--minimized")
+        subprocess.Popen(launch_cmd, cwd=os.path.dirname(target_exe), close_fds=True)
+    return 0
 
 
 class MusicalPredatorSetupWizard:
@@ -164,7 +435,7 @@ class MusicalPredatorSetupWizard:
         # Version Badge on Right
         lbl_ver = tk.Label(
             header,
-            text="v1.0.0",
+            text=f"v{APP_VERSION}",
             font=(FONT_MONO, 8, "bold"),
             fg=COLOR_BG,
             bg=COLOR_ACCENT,
@@ -504,171 +775,18 @@ class MusicalPredatorSetupWizard:
 
     def _run_installation(self):
         try:
-            target_dir = os.path.normpath(self.var_install_dir.get())
-            self._set_progress(10, f"Creating destination directory: {target_dir}")
-            os.makedirs(target_dir, exist_ok=True)
-            time.sleep(0.2)
-
-            # 1. Terminate any running instances
-            self._set_progress(20, "Checking running processes...")
-            try:
-                subprocess.run(["taskkill", "/F", "/IM", "MusicalPredator.exe"], capture_output=True)
-                subprocess.run(["taskkill", "/F", "/IM", "PredatorSync.exe"], capture_output=True)
-            except Exception:
-                pass
-            time.sleep(0.2)
-
-            # 2. Extract payload
-            exe_src, assets_src = get_payload_paths()
-            if not exe_src or not os.path.exists(exe_src):
-                raise RuntimeError("MusicalPredator.exe payload not found in installer package.")
-
-            self._set_progress(40, "Copying MusicalPredator.exe binary...")
-            target_exe = os.path.join(target_dir, "MusicalPredator.exe")
-            shutil.copy2(exe_src, target_exe)
-            time.sleep(0.2)
-
-            if assets_src and os.path.isdir(assets_src):
-                self._set_progress(55, "Copying application assets and icons...")
-                target_assets = os.path.join(target_dir, "assets")
-                if os.path.exists(target_assets):
-                    shutil.rmtree(target_assets)
-                shutil.copytree(assets_src, target_assets)
-            time.sleep(0.2)
-
-            # 3. Create Shortcuts
-            target_ico = os.path.join(target_dir, "assets", "predator_icon.ico")
-            icon_loc = f"{target_ico}, 0" if os.path.exists(target_ico) else ""
-
-            if self.var_shortcut_desktop.get():
-                self._set_progress(70, "Creating Desktop shortcut...")
-                self._create_shortcut(
-                    shortcut_name="MusicalPredator.lnk",
-                    folder=os.path.expanduser(r"~\Desktop"),
-                    target=target_exe,
-                    work_dir=target_dir,
-                    icon=icon_loc,
-                    desc="Acer Predator Helios Neo 16 4-Zone RGB Music Sync"
-                )
-
-            if self.var_shortcut_start.get():
-                self._set_progress(80, "Creating Start Menu shortcuts...")
-                start_dir = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\MusicalPredator")
-                os.makedirs(start_dir, exist_ok=True)
-                self._create_shortcut(
-                    shortcut_name="MusicalPredator.lnk",
-                    folder=start_dir,
-                    target=target_exe,
-                    work_dir=target_dir,
-                    icon=icon_loc,
-                    desc="Acer Predator Helios Neo 16 4-Zone RGB Music Sync"
-                )
-
-            # 4. Create Uninstaller
-            self._set_progress(85, "Creating uninstaller...")
-            self._create_uninstaller(target_dir)
-
-            # 5. Register in Windows Add/Remove Programs
-            self._set_progress(90, "Registering in Windows Installed Apps...")
-            self._register_uninstall_entry(target_dir, target_exe, target_ico)
-
-            # 6. Autostart on boot
-            if self.var_autostart.get():
-                self._set_progress(95, "Configuring Start on Windows Boot...")
-                self._configure_autostart(target_exe)
-
-            self._set_progress(100, "Installation completed successfully!")
-            time.sleep(0.4)
+            perform_installation(
+                install_dir=self.var_install_dir.get(),
+                create_desktop_shortcut=self.var_shortcut_desktop.get(),
+                create_start_shortcut=self.var_shortcut_start.get(),
+                enable_autostart=self.var_autostart.get(),
+                progress_cb=self._set_progress,
+            )
+            time.sleep(0.3)
             self.root.after(0, lambda: self.show_screen(4))
-
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Installation Error", f"Installation failed:\n{e}"))
             self.root.after(0, lambda: self.show_screen(2))
-
-    def _create_shortcut(self, shortcut_name: str, folder: str, target: str, work_dir: str, icon: str = "", desc: str = ""):
-        """Creates a Windows .lnk shortcut using temporary VBScript execution."""
-        os.makedirs(folder, exist_ok=True)
-        lnk_path = os.path.join(folder, shortcut_name)
-        vbs_script = f"""
-Set WshShell = CreateObject("WScript.Shell")
-Set oShortcut = WshShell.CreateShortcut("{lnk_path.replace('\\', '\\\\')}")
-oShortcut.TargetPath = "{target.replace('\\', '\\\\')}"
-oShortcut.WorkingDirectory = "{work_dir.replace('\\', '\\\\')}"
-oShortcut.Description = "{desc}"
-"""
-        if icon:
-            vbs_script += f'oShortcut.IconLocation = "{icon.replace("\\", "\\\\")}"\n'
-        vbs_script += "oShortcut.Save\n"
-
-        subprocess.run(["cscript", "//nologo", "/E:VBScript"], input=vbs_script, text=True, capture_output=True)
-
-    def _create_uninstaller(self, install_dir: str):
-        """Creates clean uninstallation scripts."""
-        uninst_bat_path = os.path.join(install_dir, "uninstall.bat")
-        bat_content = f"""@echo off
-title MusicalPredator Uninstaller
-echo ======================================================================
-echo Uninstalling MusicalPredator...
-echo ======================================================================
-
-:: Kill running instances
-taskkill /F /IM MusicalPredator.exe >nul 2>&1
-taskkill /F /IM PredatorSync.exe >nul 2>&1
-
-:: Remove Autostart Key
-reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "MusicalPredator" /f >nul 2>&1
-reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "PredatorMusicSync" /f >nul 2>&1
-
-:: Remove Uninstall Registration Key
-reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MusicalPredator" /f >nul 2>&1
-reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PredatorSync" /f >nul 2>&1
-
-:: Remove Shortcuts
-del /Q "%USERPROFILE%\\Desktop\\MusicalPredator.lnk" >nul 2>&1
-del /Q "%USERPROFILE%\\Desktop\\Predator Keyboard Sync.lnk" >nul 2>&1
-rd /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\MusicalPredator" >nul 2>&1
-rd /S /Q "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Predator Sync" >nul 2>&1
-
-:: Delete installation files (self-deleting batch)
-start /b "" cmd /c timeout /t 1 /nobreak ^>nul ^& rd /S /Q "{install_dir}"
-echo.
-echo Uninstallation Complete.
-if "%1"=="" pause
-exit
-"""
-        with open(uninst_bat_path, "w", encoding="utf-8") as f:
-            f.write(bat_content)
-
-    def _register_uninstall_entry(self, install_dir: str, exe_path: str, ico_path: str):
-        """Registers the application in HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MusicalPredator."""
-        try:
-            import winreg
-            uninstall_key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\MusicalPredator"
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, uninstall_key, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, "MusicalPredator")
-                winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, "1.0.0")
-                winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "Predator Community")
-                winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, install_dir)
-                if os.path.exists(ico_path):
-                    winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, ico_path)
-                winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, f'cmd.exe /c "{os.path.join(install_dir, "uninstall.bat")}"')
-                winreg.SetValueEx(key, "QuietUninstallString", 0, winreg.REG_SZ, f'cmd.exe /c "{os.path.join(install_dir, "uninstall.bat")} /quiet"')
-                winreg.SetValueEx(key, "EstimatedSize", 0, winreg.REG_DWORD, 36000)
-                winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
-                winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
-        except Exception as e:
-            print(f"Warning: Failed to write uninstall registry: {e}")
-
-    def _configure_autostart(self, exe_path: str):
-        """Registers start on boot in HKCU Run."""
-        try:
-            import winreg
-            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            cmd = f'"{exe_path}" --minimized'
-            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE) as key:
-                winreg.SetValueEx(key, "MusicalPredator", 0, winreg.REG_SZ, cmd)
-        except Exception as e:
-            print(f"Warning: Failed to set autostart: {e}")
 
     # --------------------------------------------------------------------------
     # SCREEN 4: Finish
@@ -748,10 +866,22 @@ exit
             self.root.destroy()
 
 
-def main():
+def main(argv: Optional[Sequence[str]] = None):
+    opts = parse_installer_args(sys.argv[1:] if argv is None else argv)
+    if opts.get("silent"):
+        try:
+            code = run_silent_install(opts)
+        except Exception as exc:
+            print(f"Silent installation failed: {exc}", file=sys.stderr)
+            code = 1
+        if argv is None:
+            sys.exit(code)
+        return code
+
     root = tk.Tk()
     app = MusicalPredatorSetupWizard(root)
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":

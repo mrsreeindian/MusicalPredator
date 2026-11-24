@@ -27,6 +27,7 @@ from tkinter import ttk, scrolledtext, filedialog
 from typing import Optional, Callable, List, Tuple, Dict, Any
 from PIL import Image, ImageTk
 
+from .. import __version__ as APP_VERSION
 from ..core.color_extractor import ColorPalette, RGBColor, ColorPaletteExtractor
 from ..core.media_engine import MediaTrackInfo
 from ..core.audio_engine import AudioBeatState
@@ -121,6 +122,7 @@ class PredatorMusicToolbar:
         on_aux_mode_change: Optional[Callable[[str], None]] = None,
         on_start_hardware_service: Optional[Callable[[], None]] = None,
         on_toggle_physical_brightness: Optional[Callable[[bool], None]] = None,
+        on_check_updates: Optional[Callable[[], None]] = None,
         physical_brightness_supported: bool = True,
         initial_physical_brightness_enabled: bool = True,
         initial_aux_sync_enabled: bool = True,
@@ -166,6 +168,7 @@ class PredatorMusicToolbar:
         self.on_aux_mode_change = on_aux_mode_change
         self.on_start_hardware_service = on_start_hardware_service
         self.on_toggle_physical_brightness = on_toggle_physical_brightness
+        self.on_check_updates = on_check_updates
         self._physical_brightness_supported = bool(physical_brightness_supported)
         self._physical_brightness_enabled = bool(initial_physical_brightness_enabled)
         self._suppress_bright_target: Optional[int] = None
@@ -234,6 +237,9 @@ class PredatorMusicToolbar:
         self._lbl_power_status: Optional[tk.Label] = None
         self._lbl_header_track: Optional[tk.Label] = None
         self._btn_toggle: Optional[tk.Button] = None
+        self._btn_updates: Optional[tk.Button] = None
+        self._lbl_status_version: Optional[tk.Label] = None
+        self._available_update_version: Optional[str] = None
 
         # Full Realistic Keyboard Canvas & Auxiliary Mirror
         self._lbl_kb_matrix: Optional[tk.Label] = None
@@ -477,6 +483,15 @@ class PredatorMusicToolbar:
             command=lambda: self._select_tab("HARDWARE BENCHMARK")
         )
         btn_bench.pack(side="left", padx=(0, 6), pady=5)
+
+        self._btn_updates = tk.Button(
+            right, text="UPDATES", font=(self.FONT_FAMILY, 7, "bold"),
+            bg="#161616", fg=self.TEXT_WHITE, activebackground=self.ACCENT_YELLOW,
+            activeforeground="#000000", bd=0, padx=10, pady=2, cursor="hand2",
+            highlightthickness=1, highlightbackground=self.BORDER_HAIRLINE,
+            command=self._trigger_check_updates
+        )
+        self._btn_updates.pack(side="left", padx=(0, 6), pady=5)
 
         btn_tray = tk.Button(
             right, text="HIDE TO TRAY", font=(self.FONT_FAMILY, 7, "bold"),
@@ -2210,6 +2225,14 @@ class PredatorMusicToolbar:
         )
         self._lbl_status_track.pack(side="left")
 
+        self._lbl_status_version = tk.Label(
+            right, text=f"  •  v{APP_VERSION}",
+            font=(self.FONT_MONO, 6, "bold"), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL,
+            cursor="hand2"
+        )
+        self._lbl_status_version.pack(side="left")
+        self._lbl_status_version.bind("<Button-1>", self._trigger_check_updates)
+
     # =========================================================================
     # EVENT HANDLERS
     # =========================================================================
@@ -2399,6 +2422,47 @@ class PredatorMusicToolbar:
                 AcerLightingNamedPipeBackend.start_service_elevated()
             except Exception:
                 pass
+
+    def _trigger_check_updates(self, event=None):
+        """Opens the in-app Update Center dialog."""
+        if self.on_check_updates:
+            self.on_check_updates()
+
+    def set_update_available(self, version: Optional[str]):
+        """Highlights the header/status update indicator when a newer release is found."""
+        cleaned = str(version).strip() if version else None
+        self._available_update_version = cleaned
+        if not (self.root and self.root.winfo_exists()):
+            return
+        try:
+            if self._btn_updates:
+                if cleaned:
+                    self._btn_updates.config(
+                        text=f"UPDATE v{cleaned}",
+                        bg="#0D2614",
+                        fg=self.ACCENT_GREEN,
+                        highlightbackground=self.ACCENT_GREEN,
+                    )
+                else:
+                    self._btn_updates.config(
+                        text="UPDATES",
+                        bg="#161616",
+                        fg=self.TEXT_WHITE,
+                        highlightbackground=self.BORDER_HAIRLINE,
+                    )
+            if self._lbl_status_version:
+                if cleaned:
+                    self._lbl_status_version.config(
+                        text=f"  •  v{APP_VERSION} (v{cleaned} AVAILABLE)",
+                        fg=self.ACCENT_GREEN,
+                    )
+                else:
+                    self._lbl_status_version.config(
+                        text=f"  •  v{APP_VERSION}",
+                        fg=self.TEXT_MUTED,
+                    )
+        except Exception:
+            pass
 
     # =========================================================================
     # REAL-TIME 60 FPS RENDER LOOP & GUI TICK

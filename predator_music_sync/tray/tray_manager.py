@@ -81,6 +81,7 @@ class PredatorTrayManager:
         on_exit_app: Callable[[], None],
         on_toggle_autostart: Optional[Callable[[bool], None]] = None,
         on_set_brightness: Optional[Callable[[int], None]] = None,
+        on_check_updates: Optional[Callable[[], None]] = None,
         initial_lighting_active: bool = True,
         initial_mode: str = "Dynamic Studio EQ",
         initial_brightness: int = 100,
@@ -93,6 +94,7 @@ class PredatorTrayManager:
         self.on_exit_app = on_exit_app
         self.on_toggle_autostart = on_toggle_autostart
         self.on_set_brightness = on_set_brightness
+        self.on_check_updates = on_check_updates
 
         self._lighting_active = initial_lighting_active
         self._current_mode = initial_mode
@@ -100,6 +102,7 @@ class PredatorTrayManager:
         self._hw_status_text = hardware_status_text
         self._power_status_text = "Plugged In"
         self._disable_on_battery_saver = True
+        self._available_update_version: Optional[str] = None
 
         self._icon: Optional[pystray.Icon] = None
         self._icon_lock = threading.RLock()
@@ -197,6 +200,10 @@ class PredatorTrayManager:
             item(lambda it: f"Power: {self._power_status_text}", lambda icon, it: None, enabled=False),
             item(lambda it: f"Hardware: {self._hw_status_text}", lambda icon, it: None, enabled=False),
             Menu.SEPARATOR,
+            item(
+                lambda it: f"Update Available (v{self._available_update_version})..." if self._available_update_version else "Check for Updates...",
+                self._handle_check_updates
+            ),
             item("Hide to System Tray", self._handle_hide_window),
             item("Exit Completely", self._handle_exit_app)
         )
@@ -270,6 +277,26 @@ class PredatorTrayManager:
     def update_autostart_state(self):
         self._safe_update_menu()
 
+    def set_update_available(self, version: Optional[str]):
+        """Updates the tray menu item to advertise an available update version."""
+        cleaned = str(version).strip() if version else None
+        if cleaned != self._available_update_version:
+            self._available_update_version = cleaned
+            self._safe_update_menu()
+
+    def notify_update_available(self, version: str):
+        """Updates tray label and shows a balloon notification for an available update."""
+        self.set_update_available(version)
+        with self._icon_lock:
+            if self._icon:
+                try:
+                    self._icon.notify(
+                        f"MusicalPredator v{version} is available! Right-click tray icon and select 'Update Available' to update.",
+                        "MusicalPredator Update"
+                    )
+                except Exception:
+                    pass
+
     def update_hardware_status(self, status_text: str):
         """Updates the hardware status line shown in the tray context menu."""
         if status_text != self._hw_status_text:
@@ -337,6 +364,10 @@ class PredatorTrayManager:
 
     def _handle_step_brightness(self, delta: int):
         self._handle_set_brightness(self._current_brightness + int(delta))
+
+    def _handle_check_updates(self, icon, item):
+        if self.on_check_updates:
+            self.on_check_updates()
 
     def _handle_exit_app(self, icon, item):
         if self.on_exit_app:

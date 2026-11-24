@@ -22,11 +22,13 @@ if parent_dir not in sys.path:
 from predator_music_sync.service.sync_service import PredatorSyncService
 from predator_music_sync.tray.tray_manager import PredatorTrayManager
 from predator_music_sync.gui.toolbar import PredatorMusicToolbar
+from predator_music_sync.gui.update_dialog import UpdateDialog
 from predator_music_sync.core.media_engine import MediaTrackInfo
 from predator_music_sync.core.audio_engine import AudioBeatState
 from predator_music_sync.core.color_extractor import RGBColor
 from predator_music_sync.utils.autostart import is_autostart_enabled, set_autostart
 from predator_music_sync.utils.power import PowerStatus, PowerMonitor
+from predator_music_sync.utils.updater import UpdateManager
 from predator_music_sync.hardware.device_detector import detect_laptop_model, LaptopModelInfo
 
 
@@ -49,6 +51,13 @@ class PredatorMusicSyncApp:
         self._last_gui_hw_connected: Optional[bool] = None
         self._last_tray_power_key: Optional[Tuple[bool, bool, int]] = None
         self._latest_power_status: Optional[PowerStatus] = None
+        self._update_dialog: Optional[UpdateDialog] = None
+        self._startup_update_timer: Optional[threading.Timer] = None
+
+        self.update_manager = UpdateManager(
+            on_prepare_shutdown=self.exit_completely,
+            relaunch_minimized=self.start_minimized,
+        )
 
         # 1. Initialize dedicated background sync service
         self.service = PredatorSyncService(
@@ -90,6 +99,7 @@ class PredatorMusicSyncApp:
             on_battery_effect_change=lambda mode: self.service.set_battery_profile(mode=mode),
             on_battery_brightness_cap_change=self.service.set_battery_brightness_cap,
             on_toggle_physical_brightness=self.service.set_physical_brightness_enabled,
+            on_check_updates=self.open_update_dialog,
             physical_brightness_supported=self.service.is_physical_brightness_supported(),
             initial_physical_brightness_enabled=self.service.is_physical_brightness_enabled(),
             laptop_info=laptop_info,
@@ -121,6 +131,7 @@ class PredatorMusicSyncApp:
             on_exit_app=self.exit_completely,
             on_toggle_autostart=self.toggle_autostart,
             on_set_brightness=self.set_brightness,
+            on_check_updates=self.open_update_dialog,
             initial_lighting_active=self.service._lighting_enabled,
             initial_mode=self.service.active_animation_name,
             initial_brightness=self.service.get_brightness(),
@@ -328,6 +339,66 @@ class PredatorMusicSyncApp:
             self.tray.update_autostart_state()
         self._dispatch_to_gui(lambda e=enabled: self.gui.set_autostart_state(e))
 
+    def open_update_dialog(self):
+        """Thread-safely opens the in-app Update Center dialog from GUI or tray."""
+        self._dispatch_to_gui(self._open_update_dialog_main)
+
+    def _open_update_dialog_main(self):
+        if self._is_exiting or not self.gui or not self.gui.root:
+            return
+        try:
+            if self.gui.root.state() == "withdrawn":
+                self._restore_and_sync_gui()
+        except Exception:
+            pass
+        if self._update_dialog and self._update_dialog.win and self._update_dialog.win.winfo_exists():
+            self._update_dialog.show()
+            return
+        last_res = self.update_manager.last_result
+        self._update_dialog = UpdateDialog(
+            self.gui.root,
+            self.update_manager,
+            initial_result=last_res,
+            auto_check=(last_res is None),
+            on_result_cb=self._on_update_check_result,
+        )
+        self._update_dialog.show()
+
+    def _on_update_check_result(self, res):
+        if self._is_exiting or res is None:
+            return
+        avail = res.latest_version if (res.update_available and not res.is_skipped) else None
+        if self.tray and hasattr(self.tray, "set_update_available"):
+            self.tray.set_update_available(avail)
+        if self.gui and hasattr(self.gui, "set_update_available"):
+            self._dispatch_to_gui(lambda v=avail: self.gui.set_update_available(v))
+
+    def _schedule_startup_update_check(self):
+        if self._is_exiting or not self.update_manager.config.auto_check_on_startup:
+            return
+        if self._startup_update_timer is not None:
+            return
+        timer = threading.Timer(4.0, self._run_startup_update_check)
+        timer.daemon = True
+        self._startup_update_timer = timer
+        timer.start()
+
+    def _run_startup_update_check(self):
+        if self._is_exiting:
+            return
+        try:
+            res = self.update_manager.check_for_updates(respect_skip=True, timeout=8.0)
+            if self._is_exiting:
+                return
+            if res.update_available:
+                if self.tray and hasattr(self.tray, "notify_update_available"):
+                    self.tray.notify_update_available(res.latest_version)
+                if self.gui and hasattr(self.gui, "set_update_available"):
+                    self._dispatch_to_gui(lambda v=res.latest_version: self.gui.set_update_available(v))
+        except Exception:
+            # Silent non-intrusive fallback when offline or rate-limited on startup
+            pass
+
     def save_profile(self, name: str, filepath: Optional[str] = None) -> str:
         if filepath is None:
             profiles_dir = os.path.join(parent_dir, "profiles")
@@ -398,6 +469,12 @@ class PredatorMusicSyncApp:
                 return
             self._is_exiting = True
         print("Shutting down Predator Sync Application completely...", flush=True)
+        if self._startup_update_timer:
+            try:
+                self._startup_update_timer.cancel()
+            except Exception:
+                pass
+            self._startup_update_timer = None
         try:
             self.service.remove_state_listener(self._on_service_state_tick)
             self.service.remove_power_listener(self._on_power_state_changed)
@@ -436,6 +513,7 @@ class PredatorMusicSyncApp:
         # 3. Create GUI Window and start main-thread cross-thread queue pump
         self.gui.create_window()
         self._start_gui_queue_pump()
+        self._schedule_startup_update_check()
 
         if self.start_minimized:
             self.gui.hide_to_tray()
