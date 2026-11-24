@@ -60,6 +60,27 @@ class BaseAnimation:
     def __init__(self):
         self.speed: float = 1.0
         self.flash_intensity: float = 0.25  # 0.0 = completely smooth/no flash, 1.0 = punchy white overdrive
+        self._last_output: List[RGBColor] = [(0, 0, 0)] * 4
+
+    def _clamp_dt(self, dt: float) -> float:
+        return max(0.0, min(0.5, float(dt)))
+
+    def _decay_to_silence(self, dt: float) -> List[RGBColor]:
+        """Smoothly decays previous frame towards pure black (0,0,0) during silence."""
+        dt_c = self._clamp_dt(dt)
+        decay = math.exp(-14.0 * dt_c)
+        decayed: List[RGBColor] = []
+        for r, g, b in self._last_output:
+            nr = int(round(r * decay))
+            ng = int(round(g * decay))
+            nb = int(round(b * decay))
+            decayed.append((0 if nr <= 1 else nr, 0 if ng <= 1 else ng, 0 if nb <= 1 else nb))
+        self._last_output = decayed
+        return list(decayed)
+
+    def _record_output(self, colors: List[RGBColor]) -> List[RGBColor]:
+        self._last_output = list(colors)
+        return colors
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
         raise NotImplementedError
@@ -89,13 +110,14 @@ class SpectrumEqualizer(BaseAnimation):
         self._peaks = [0.0, 0.0, 0.0, 0.0]
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence gating: decay to pure dark
             for i in range(4):
                 self._levels[i] = max(0.0, self._levels[i] * math.exp(-14.0 * dt))
                 self._peaks[i] = max(0.0, self._peaks[i] - 2.0 * dt)
             base_colors = [palette.zone1, palette.zone2, palette.zone3, palette.zone4]
-            return [_scale_color(base_colors[i], self._levels[i]) for i in range(4)]
+            return self._record_output([_scale_color(base_colors[i], self._levels[i]) for i in range(4)])
 
         bands = audio_state.smoothed_bands
         # Musical perceptual power curve (E^1.35): provides punchy dynamics without crushing normal audio into darkness
@@ -147,7 +169,7 @@ class SpectrumEqualizer(BaseAnimation):
             active_lvl = min(1.35, max(0.18, lvl * 1.25))
             result.append(_scale_color(c, active_lvl))
 
-        return result
+        return self._record_output(result)
 
 
 # ==============================================================================
@@ -171,10 +193,11 @@ class KnightRiderScanner(BaseAnimation):
         self._level = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to pure dark and freeze
-            self._level = max(0.0, self._level * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._level = max(0.0, self._level * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         # Advance step strictly on beat hits or strong transients
         if audio_state.is_beat:
@@ -188,7 +211,7 @@ class KnightRiderScanner(BaseAnimation):
                 self._dir = 1.0
 
         # Rapid smooth interpolation towards target position (snappy beat jump)
-        self._pos += (self._target_pos - self._pos) * min(1.0, 24.0 * dt)
+        self._pos += (self._target_pos - self._pos) * min(1.0, 24.0 * self.speed * dt)
         self._level = max(0.0, self._level * math.exp(-7.5 * dt))
 
         base_colors = [palette.zone1, palette.zone2, palette.zone3, palette.zone4]
@@ -197,19 +220,20 @@ class KnightRiderScanner(BaseAnimation):
         beam_width = 0.85
         two_w_sq = 2.0 * (beam_width ** 2)
         gate = min(1.0, (audio_state.overall_energy - 0.05) / 0.12)
+        active_level = max(self._level, (audio_state.overall_energy ** 1.4) * 0.55)
 
         for i in range(4):
             dist = abs(i - self._pos)
             val = math.exp(- (dist ** 2) / two_w_sq)
-            intensity = min(1.35, val * self._level * gate)
+            intensity = min(1.35, val * active_level * gate)
 
             c = base_colors[i]
-            if val > 0.80 and self._level > 0.80 and self.flash_intensity > 0.05:
-                c = _blend_white(c, (self._level - 0.80) * 0.55, self.flash_intensity)
+            if val > 0.80 and active_level > 0.80 and self.flash_intensity > 0.05:
+                c = _blend_white(c, (active_level - 0.80) * 0.55, self.flash_intensity)
 
             result.append(_scale_color(c, intensity))
 
-        return result
+        return self._record_output(result)
 
 
 class WaterfallCascade(BaseAnimation):
@@ -228,10 +252,11 @@ class WaterfallCascade(BaseAnimation):
         self._surge = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: flow is 0, decay to dark
-            self._surge = max(0.0, self._surge * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._surge = max(0.0, self._surge * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         # Flow velocity driven strictly by audio energy
         flow_speed = (audio_state.overall_energy ** 1.6) * 3.8 * self.speed
@@ -264,7 +289,7 @@ class WaterfallCascade(BaseAnimation):
 
             result.append(_scale_color(c_flow, level))
 
-        return result
+        return self._record_output(result)
 
 
 class PingPongRebound(BaseAnimation):
@@ -285,11 +310,12 @@ class PingPongRebound(BaseAnimation):
         self._bumper_flashes = [0.0, 0.0]
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to zero
             for i in range(4):
-                self._tail[i] = max(0.0, self._tail[i] * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+                self._tail[i] = max(0.0, self._tail[i] * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         # Kinetic rebound triggers strictly on kick transients / beats
         if audio_state.is_beat or audio_state.is_hard_kick:
@@ -304,7 +330,7 @@ class PingPongRebound(BaseAnimation):
                 self._bumper_flashes[0] = 1.35  # Left bumper impact flash
 
         # Smooth kinetic transit towards target
-        self._pos += (self._target_pos - self._pos) * min(1.0, 20.0 * dt)
+        self._pos += (self._target_pos - self._pos) * min(1.0, 20.0 * self.speed * dt)
 
         decay_tail = math.exp(-8.0 * dt)
         decay_bumper = math.exp(-9.0 * dt)
@@ -333,7 +359,7 @@ class PingPongRebound(BaseAnimation):
 
             result.append(_scale_color(c, val))
 
-        return result
+        return self._record_output(result)
 
 
 # ==============================================================================
@@ -355,10 +381,11 @@ class HarmonicWave(BaseAnimation):
         self._beat_env = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: wave freezes and decays to dark
-            self._beat_env = max(0.0, self._beat_env * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._beat_env = max(0.0, self._beat_env * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         # Phase velocity proportional to audio energy
         bpm = max(60.0, min(180.0, audio_state.bpm_estimate))
@@ -392,7 +419,7 @@ class HarmonicWave(BaseAnimation):
 
             result.append(_scale_color(c, level))
 
-        return result
+        return self._record_output(result)
 
 
 class CenterWaveRipple(BaseAnimation):
@@ -412,11 +439,12 @@ class CenterWaveRipple(BaseAnimation):
         self._outer_snap = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to zero
-            self._center_snap = max(0.0, self._center_snap * math.exp(-12.0 * dt))
-            self._outer_snap = max(0.0, self._outer_snap * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._center_snap = max(0.0, self._center_snap * math.exp(-14.0 * dt))
+            self._outer_snap = max(0.0, self._outer_snap * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         if audio_state.is_beat:
             self._radius = 0.0
@@ -456,7 +484,7 @@ class CenterWaveRipple(BaseAnimation):
 
             result.append(_scale_color(c, level))
 
-        return result
+        return self._record_output(result)
 
 
 # ==============================================================================
@@ -478,10 +506,11 @@ class ChromaGradientFlow(BaseAnimation):
         self._warmth_env = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: freeze and decay to dark
-            self._warmth_env = max(0.0, self._warmth_env * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._warmth_env = max(0.0, self._warmth_env * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         # Flow speed scales with audio energy
         speed = 0.9 * self.speed * (audio_state.overall_energy ** 1.3)
@@ -510,7 +539,7 @@ class ChromaGradientFlow(BaseAnimation):
 
             result.append(_scale_color(c_morph, base_level))
 
-        return result
+        return self._record_output(result)
 
 
 class StarlightTwinkle(BaseAnimation):
@@ -529,10 +558,11 @@ class StarlightTwinkle(BaseAnimation):
         self._flare_env = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to zero
-            self._flare_env = max(0.0, self._flare_env * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._flare_env = max(0.0, self._flare_env * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         treble = (float(audio_state.smoothed_bands[3]) ** 1.8) if len(audio_state.smoothed_bands) > 3 else 0.0
         high_mid = (float(audio_state.smoothed_bands[2]) ** 1.8) if len(audio_state.smoothed_bands) > 2 else 0.0
@@ -563,7 +593,7 @@ class StarlightTwinkle(BaseAnimation):
 
             result.append(_scale_color(c, level))
 
-        return result
+        return self._record_output(result)
 
 
 class EnergyBreathing(BaseAnimation):
@@ -581,10 +611,11 @@ class EnergyBreathing(BaseAnimation):
         self._beat_env = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to zero
-            self._beat_env = max(0.0, self._beat_env * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._beat_env = max(0.0, self._beat_env * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         bpm = max(60.0, min(160.0, audio_state.bpm_estimate))
         freq = (bpm / 60.0) * math.pi * 2.0 * self.speed * (audio_state.overall_energy ** 0.8)
@@ -617,7 +648,7 @@ class EnergyBreathing(BaseAnimation):
 
             result.append(_scale_color(c, level))
 
-        return result
+        return self._record_output(result)
 
 
 # ==============================================================================
@@ -640,11 +671,12 @@ class BassWasdFocus(BaseAnimation):
         self._melodic_snap = 0.0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to zero
-            self._kick_level = max(0.0, self._kick_level * math.exp(-12.0 * dt))
-            self._melodic_snap = max(0.0, self._melodic_snap * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+            self._kick_level = max(0.0, self._kick_level * math.exp(-14.0 * dt))
+            self._melodic_snap = max(0.0, self._melodic_snap * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         bands = audio_state.smoothed_bands
         sub_bass = (float(bands[0]) ** 2.2) if len(bands) > 0 else 0.0
@@ -679,7 +711,7 @@ class BassWasdFocus(BaseAnimation):
                 c = _blend_white(c, (self._melodic_snap - 0.85) * 0.45, self.flash_intensity)
             result.append(_scale_color(c, lvl))
 
-        return result
+        return self._record_output(result)
 
 
 class CenterBeatPulse(BaseAnimation):
@@ -696,11 +728,12 @@ class CenterBeatPulse(BaseAnimation):
         self._energies = [0.0, 0.0, 0.0, 0.0]
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to zero
             for i in range(4):
-                self._energies[i] = max(0.0, self._energies[i] * math.exp(-12.0 * dt))
-            return [(0, 0, 0)] * 4
+                self._energies[i] = max(0.0, self._energies[i] * math.exp(-14.0 * dt))
+            return self._decay_to_silence(dt)
 
         # Instant 0ms snap on beat hits
         if audio_state.is_beat:
@@ -733,7 +766,7 @@ class CenterBeatPulse(BaseAnimation):
                 c = _blend_white(c, white_f, self.flash_intensity)
             result.append(_scale_color(c, min(1.35, e)))
 
-        return result
+        return self._record_output(result)
 
 
 class BeatStrobe(BaseAnimation):
@@ -751,11 +784,12 @@ class BeatStrobe(BaseAnimation):
         self._strobe_counter = 0
 
     def update(self, audio_state: AudioBeatState, palette: ColorPalette, dt: float) -> List[RGBColor]:
+        dt = self._clamp_dt(dt)
         if audio_state.overall_energy < 0.05:
             # Silence: decay to zero
             for i in range(4):
                 self._strobes[i] = max(0.0, self._strobes[i] * math.exp(-14.0 * dt))
-            return [(0, 0, 0)] * 4
+            return self._decay_to_silence(dt)
 
         if audio_state.is_beat:
             self._strobe_counter += 1
@@ -788,7 +822,7 @@ class BeatStrobe(BaseAnimation):
                 c = _blend_white(c, min(0.70, (val - 0.70) * 0.75), self.flash_intensity)
             result.append(_scale_color(c, min(1.35, val)))
 
-        return result
+        return self._record_output(result)
 
 
 # ==============================================================================

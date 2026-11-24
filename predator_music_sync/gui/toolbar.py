@@ -32,7 +32,13 @@ from ..core.media_engine import MediaTrackInfo
 from ..core.audio_engine import AudioBeatState
 from ..core.animations import ANIMATION_REGISTRY
 from ..utils.autostart import is_autostart_enabled, set_autostart
-from ..hardware.device_detector import detect_laptop_model, LaptopModelInfo, KeyboardType
+from ..hardware.device_detector import (
+    detect_laptop_model,
+    LaptopModelInfo,
+    KeyboardType,
+    map_4zone_to_n,
+    map_auxiliary_device_colors,
+)
 
 
 def _rgb_to_hex(rgb: RGBColor) -> str:
@@ -44,6 +50,22 @@ def _dim_color(rgb: RGBColor, factor: float) -> str:
     g = int(max(0, min(255, rgb[1] * factor)))
     b = int(max(0, min(255, rgb[2] * factor)))
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _blend_over_base(base: RGBColor, led_rgb: RGBColor, factor: float) -> str:
+    """Blends backlit LED emission smoothly over dark keycap plastic with zero low-level pop."""
+    r = int(max(0, min(255, round(base[0] + led_rgb[0] * factor))))
+    g = int(max(0, min(255, round(base[1] + led_rgb[1] * factor))))
+    b = int(max(0, min(255, round(base[2] + led_rgb[2] * factor))))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _scale_rgb_brightness(rgb: RGBColor, scale: float) -> RGBColor:
+    return (
+        int(max(0, min(255, round(rgb[0] * scale)))),
+        int(max(0, min(255, round(rgb[1] * scale)))),
+        int(max(0, min(255, round(rgb[2] * scale)))),
+    )
 
 
 class PredatorMusicToolbar:
@@ -171,6 +193,12 @@ class PredatorMusicToolbar:
         self._aux_sync_enabled = initial_aux_sync_enabled
         self._aux_mode = initial_aux_mode
         self._kb_key_x_rels: List[float] = []
+        self._kb_key_norm_x: List[float] = []
+        self._kb_key_texts: List[int] = []
+        self._kb_key_labels: List[str] = []
+        self._kb_key_predator: List[int] = []
+        self._lightbar_segs: List[int] = []
+        self._pending_is_beat: bool = False
 
         # Equalizer band gains: [Sub-Bass, Low-Mid, High-Mid, Treble]
         self._band_gains = [1.0, 1.0, 1.0, 1.0]
@@ -484,7 +512,7 @@ class PredatorMusicToolbar:
         ).pack(side="left")
 
         self._lbl_kb_matrix = tk.Label(
-            hdr, text=f"{self.laptop_info.model_name.upper()} MATRIX • {self.laptop_info.keyboard_type.value.upper()} • 80+ KEYS",
+            hdr, text=f"{self.laptop_info.model_name.upper()} MATRIX • {self.laptop_info.keyboard_type.value.upper()} • 100 KEYS",
             font=(self.FONT_FAMILY, 7), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL
         )
         self._lbl_kb_matrix.pack(side="right")
@@ -494,7 +522,14 @@ class PredatorMusicToolbar:
         self._frame_aux.pack(fill="x", padx=8, pady=(1, 2))
         self._frame_aux.pack_propagate(False)
 
-        aux_lbl_text = "REAR LIGHTBAR & LOGO //" if self.laptop_info.has_rear_lightbar else "AUX PERIPHERALS //"
+        has_aux = bool(self.laptop_info.has_rear_lightbar or self.laptop_info.has_lid_logo)
+        if self.laptop_info.has_rear_lightbar:
+            aux_lbl_text = "REAR LIGHTBAR & LOGO //"
+        elif self.laptop_info.has_lid_logo:
+            aux_lbl_text = "PREDATOR LID LOGO //"
+        else:
+            aux_lbl_text = "AUX PERIPHERALS // NONE ON MODEL"
+
         self._lbl_aux_badge = tk.Label(
             self._frame_aux, text=aux_lbl_text,
             font=(self.FONT_FAMILY, 6, "bold"), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL
@@ -503,16 +538,18 @@ class PredatorMusicToolbar:
 
         self._canvas_lightbar = tk.Canvas(self._frame_aux, height=8, bg="#0A0A0A", bd=0, highlightthickness=1, highlightbackground=self.BORDER_HAIRLINE)
         self._canvas_lightbar.pack(side="left", fill="x", expand=True)
-        self._lightbar_rect = self._canvas_lightbar.create_rectangle(0, 0, 1200, 8, fill="#181818", outline="")
+        self._canvas_lightbar.bind("<Configure>", self._redraw_lightbar_canvas)
+        self._lightbar_rect = self._canvas_lightbar.create_rectangle(0, 0, 1200, 8, fill="#101010", outline="")
+        self._lightbar_segs = [self._lightbar_rect]
 
         self._btn_aux_toggle = tk.Button(
             self._frame_aux,
-            text="AUX SYNC: ON" if self._aux_sync_enabled else "AUX SYNC: OFF",
+            text="AUX SYNC: ON" if (self._aux_sync_enabled and has_aux) else ("AUX SYNC: OFF" if has_aux else "AUX: N/A"),
             font=(self.FONT_FAMILY, 6, "bold"),
-            bg=self.ACCENT_YELLOW if self._aux_sync_enabled else "#161616",
-            fg="#000000" if self._aux_sync_enabled else self.TEXT_MUTED,
+            bg=self.ACCENT_YELLOW if (self._aux_sync_enabled and has_aux) else "#161616",
+            fg="#000000" if (self._aux_sync_enabled and has_aux) else self.TEXT_MUTED,
             bd=0, padx=8, pady=0, cursor="hand2",
-            highlightthickness=1, highlightbackground=self.ACCENT_YELLOW if self._aux_sync_enabled else self.BORDER_HAIRLINE,
+            highlightthickness=1, highlightbackground=self.ACCENT_YELLOW if (self._aux_sync_enabled and has_aux) else self.BORDER_HAIRLINE,
             command=self._toggle_aux_sync_gui
         )
         self._btn_aux_toggle.pack(side="right", padx=(6, 2))
@@ -527,8 +564,8 @@ class PredatorMusicToolbar:
 
         zone_titles = [
             ("ZONE 1", "WASD / BASS (20-120Hz)"),
-            ("ZONE 2", "MID-LEFT / VOCALS (120-500Hz)"),
-            ("ZONE 3", "MID-RIGHT / MELODY (500-3.5kHz)"),
+            ("ZONE 2", "MID-LEFT / LOW-MID (120-500Hz)"),
+            ("ZONE 3", "MID-RIGHT / VOCALS (500-3.5kHz)"),
             ("ZONE 4", "NUMPAD / TREBLE (3.5-16kHz)")
         ]
         self._kb_hex_labels = []
@@ -559,8 +596,64 @@ class PredatorMusicToolbar:
 
             tk.Label(z_col, text=zone_titles[z][1], font=(self.FONT_FAMILY, 6), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL).pack(anchor="w", padx=12)
 
+    def _redraw_lightbar_canvas(self, event=None):
+        """Draws the auxiliary lightbar / lid logo LED segments matching hardware layout."""
+        if not self._canvas_lightbar:
+            return
+        w = self._canvas_lightbar.winfo_width()
+        h = self._canvas_lightbar.winfo_height()
+        if w < 20 or h < 4:
+            return
+
+        self._canvas_lightbar.delete("all")
+        self._lightbar_segs = []
+
+        if self.laptop_info.has_rear_lightbar:
+            num_segs = 12
+            gap = 2
+            seg_w = max(4.0, (w - (num_segs - 1) * gap) / float(num_segs))
+            for i in range(num_segs):
+                x1 = i * (seg_w + gap)
+                x2 = x1 + seg_w
+                seg = self._canvas_lightbar.create_rectangle(x1, 0, x2, h, fill="#101010", outline="")
+                self._lightbar_segs.append(seg)
+            self._lightbar_rect = self._lightbar_segs[0]
+        elif self.laptop_info.has_lid_logo:
+            cx = w / 2.0
+            logo_w = min(80.0, w * 0.25)
+            seg = self._canvas_lightbar.create_rectangle(cx - logo_w / 2.0, 0, cx + logo_w / 2.0, h, fill="#101010", outline="")
+            self._lightbar_segs = [seg]
+            self._lightbar_rect = seg
+        else:
+            seg = self._canvas_lightbar.create_rectangle(0, 0, w, h, fill="#101010", outline="")
+            self._lightbar_segs = [seg]
+            self._lightbar_rect = seg
+
+        self._last_rendered_colors = [(-1, -1, -1), (-1, -1, -1), (-1, -1, -1), (-1, -1, -1)]
+
+    @staticmethod
+    def _smoothstep_per_key_color(colors: List[RGBColor], norm_x: float) -> RGBColor:
+        """Evaluates continuous 4-zone Hermite smoothstep gradient matching device_detector.map_4zone_to_n."""
+        t = max(0.0, min(1.0, float(norm_x)))
+        if t <= (1.0 / 3.0):
+            u = t * 3.0
+            c1, c2 = colors[0], colors[1]
+        elif t <= (2.0 / 3.0):
+            u = (t - (1.0 / 3.0)) * 3.0
+            c1, c2 = colors[1], colors[2]
+        else:
+            u = (t - (2.0 / 3.0)) * 3.0
+            c1, c2 = colors[2], colors[3]
+        u_c = max(0.0, min(1.0, u))
+        w = u_c * u_c * (3.0 - 2.0 * u_c)
+        return (
+            int(max(0, min(255, round(c1[0] + (c2[0] - c1[0]) * w)))),
+            int(max(0, min(255, round(c1[1] + (c2[1] - c1[1]) * w)))),
+            int(max(0, min(255, round(c1[2] + (c2[2] - c1[2]) * w)))),
+        )
+
     def _draw_full_keyboard(self, event=None):
-        """Draws realistic Acer Predator Helios Neo 16 keyboard layout with 80+ keys."""
+        """Draws realistic Acer Predator Helios Neo 16 keyboard layout with aligned zones and symbols."""
         if not self._canvas_kb:
             return
 
@@ -571,11 +664,15 @@ class PredatorMusicToolbar:
 
         self._canvas_kb.delete("all")
         self._kb_key_rects = []
+        self._kb_key_texts = []
+        self._kb_key_labels = []
         self._kb_key_zones = []
         self._kb_key_wasd = []
         self._kb_key_arrows = []
+        self._kb_key_predator = []
         self._kb_zone_backs = []
         self._kb_key_x_rels = []
+        self._kb_key_norm_x = []
 
         pad_x = 4
         pad_y = 2
@@ -588,153 +685,217 @@ class PredatorMusicToolbar:
             fill="#080808", outline=self.BORDER_HAIRLINE, width=1
         )
 
-        # Underglow backdrops (adapted dynamically to zone count)
-        zone_count = self.laptop_info.zone_count if self.laptop_info.zone_count in (3, 4) else 4
-        zone_w = well_w / float(zone_count)
-        for z in range(zone_count):
-            zx1 = pad_x + (z * zone_w)
-            zx2 = zx1 + zone_w
-            zb = self._canvas_kb.create_rectangle(
-                zx1, pad_y, zx2, pad_y + well_h,
-                fill="#0D0D0D", outline="", width=0
-            )
-            self._kb_zone_backs.append(zb)
-
-        # Detailed Key definitions: (row, x_rel, width_rel, label, zone, is_wasd, is_arrow, is_predator)
+        # Detailed Key definitions:
+        # (row, x_rel, width_rel, row_span, label, zone, is_wasd, is_arrow, is_predator)
         keys_def = [
-            # Row 0: Function Row
-            (0, 0.0, 1.0, "ESC", 0, False, False, False),
-            (0, 1.2, 0.9, "F1", 0, False, False, False),
-            (0, 2.15, 0.9, "F2", 0, False, False, False),
-            (0, 3.1, 0.9, "F3", 0, False, False, False),
-            (0, 4.05, 0.9, "F4", 0, False, False, False),
-            (0, 5.15, 0.9, "F5", 1, False, False, False),
-            (0, 6.1, 0.9, "F6", 1, False, False, False),
-            (0, 7.05, 0.9, "F7", 1, False, False, False),
-            (0, 8.0, 0.9, "F8", 1, False, False, False),
-            (0, 9.1, 0.9, "F9", 2, False, False, False),
-            (0, 10.05, 0.9, "F10", 2, False, False, False),
-            (0, 11.0, 0.9, "F11", 2, False, False, False),
-            (0, 11.95, 0.9, "F12", 2, False, False, False),
-            (0, 13.0, 0.9, "PRT", 2, False, False, False),
-            (0, 13.95, 0.95, "DEL", 2, False, False, False),
+            # Row 0: Function Row & Numpad Header Row
+            (0, 0.0, 1.0, 1, "ESC", 0, False, False, False),
+            (0, 1.2, 0.9, 1, "F1", 0, False, False, False),
+            (0, 2.15, 0.9, 1, "F2", 0, False, False, False),
+            (0, 3.1, 0.9, 1, "F3", 0, False, False, False),
+            (0, 4.05, 0.9, 1, "F4", 0, False, False, False),
+            (0, 5.15, 0.9, 1, "F5", 1, False, False, False),
+            (0, 6.1, 0.9, 1, "F6", 1, False, False, False),
+            (0, 7.05, 0.9, 1, "F7", 1, False, False, False),
+            (0, 8.0, 0.9, 1, "F8", 1, False, False, False),
+            (0, 9.1, 0.9, 1, "F9", 2, False, False, False),
+            (0, 10.05, 0.9, 1, "F10", 2, False, False, False),
+            (0, 11.0, 0.9, 1, "F11", 2, False, False, False),
+            (0, 11.95, 0.9, 1, "F12", 2, False, False, False),
+            (0, 13.0, 0.9, 1, "PRT", 2, False, False, False),
+            (0, 13.95, 0.95, 1, "DEL", 2, False, False, False),
             # Numpad Row 0
-            (0, 15.2, 0.95, "[P]", 3, False, False, True),
-            (0, 16.2, 0.95, "NUM", 3, False, False, False),
-            (0, 17.2, 0.95, "/", 3, False, False, False),
-            (0, 18.2, 0.95, "*", 3, False, False, False),
+            (0, 16.15, 0.95, 1, "[P]", 3, False, False, True),
+            (0, 17.15, 0.95, 1, "HOME", 3, False, False, False),
+            (0, 18.15, 0.95, 1, "PGUP", 3, False, False, False),
+            (0, 19.15, 0.95, 1, "END", 3, False, False, False),
 
-            # Row 1: Number Row
-            (1, 0.0, 0.95, "~", 0, False, False, False),
-            (1, 1.0, 0.95, "1", 0, False, False, False),
-            (1, 2.0, 0.95, "2", 0, False, False, False),
-            (1, 3.0, 0.95, "3", 0, False, False, False),
-            (1, 4.0, 0.95, "4", 0, False, False, False),
-            (1, 5.0, 0.95, "5", 1, False, False, False),
-            (1, 6.0, 0.95, "6", 1, False, False, False),
-            (1, 7.0, 0.95, "7", 1, False, False, False),
-            (1, 8.0, 0.95, "8", 1, False, False, False),
-            (1, 9.0, 0.95, "9", 2, False, False, False),
-            (1, 10.0, 0.95, "0", 2, False, False, False),
-            (1, 11.0, 0.95, "-", 2, False, False, False),
-            (1, 12.0, 0.95, "=", 2, False, False, False),
-            (1, 13.0, 1.9, "BACK", 2, False, False, False),
+            # Row 1: Number Row & Numpad Row 1
+            (1, 0.0, 0.95, 1, "~", 0, False, False, False),
+            (1, 1.0, 0.95, 1, "1", 0, False, False, False),
+            (1, 2.0, 0.95, 1, "2", 0, False, False, False),
+            (1, 3.0, 0.95, 1, "3", 0, False, False, False),
+            (1, 4.0, 0.95, 1, "4", 0, False, False, False),
+            (1, 5.0, 0.95, 1, "5", 1, False, False, False),
+            (1, 6.0, 0.95, 1, "6", 1, False, False, False),
+            (1, 7.0, 0.95, 1, "7", 1, False, False, False),
+            (1, 8.0, 0.95, 1, "8", 1, False, False, False),
+            (1, 9.0, 0.95, 1, "9", 2, False, False, False),
+            (1, 10.0, 0.95, 1, "0", 2, False, False, False),
+            (1, 11.0, 0.95, 1, "-", 2, False, False, False),
+            (1, 12.0, 0.95, 1, "=", 2, False, False, False),
+            (1, 13.0, 1.9, 1, "BACK", 2, False, False, False),
             # Numpad Row 1
-            (1, 15.2, 0.95, "7", 3, False, False, False),
-            (1, 16.2, 0.95, "8", 3, False, False, False),
-            (1, 17.2, 0.95, "9", 3, False, False, False),
-            (1, 18.2, 0.95, "-", 3, False, False, False),
+            (1, 16.15, 0.95, 1, "NUM", 3, False, False, False),
+            (1, 17.15, 0.95, 1, "/", 3, False, False, False),
+            (1, 18.15, 0.95, 1, "*", 3, False, False, False),
+            (1, 19.15, 0.95, 1, "-", 3, False, False, False),
 
-            # Row 2: QWERTY Row
-            (2, 0.0, 1.45, "TAB", 0, False, False, False),
-            (2, 1.5, 0.95, "Q", 0, False, False, False),
-            (2, 2.5, 0.95, "W", 0, True, False, False),
-            (2, 3.5, 0.95, "E", 0, False, False, False),
-            (2, 4.5, 0.95, "R", 0, False, False, False),
-            (2, 5.5, 0.95, "T", 1, False, False, False),
-            (2, 6.5, 0.95, "Y", 1, False, False, False),
-            (2, 7.5, 0.95, "U", 1, False, False, False),
-            (2, 8.5, 0.95, "I", 1, False, False, False),
-            (2, 9.5, 0.95, "O", 2, False, False, False),
-            (2, 10.5, 0.95, "P", 2, False, False, False),
-            (2, 11.5, 0.95, "[", 2, False, False, False),
-            (2, 12.5, 0.95, "]", 2, False, False, False),
-            (2, 13.5, 1.4, "\\", 2, False, False, False),
+            # Row 2: QWERTY Row & Numpad Row 2 (tall '+' spans rows 2-3)
+            (2, 0.0, 1.45, 1, "TAB", 0, False, False, False),
+            (2, 1.5, 0.95, 1, "Q", 0, False, False, False),
+            (2, 2.5, 0.95, 1, "W", 0, True, False, False),
+            (2, 3.5, 0.95, 1, "E", 0, False, False, False),
+            (2, 4.5, 0.95, 1, "R", 0, False, False, False),
+            (2, 5.5, 0.95, 1, "T", 1, False, False, False),
+            (2, 6.5, 0.95, 1, "Y", 1, False, False, False),
+            (2, 7.5, 0.95, 1, "U", 1, False, False, False),
+            (2, 8.5, 0.95, 1, "I", 1, False, False, False),
+            (2, 9.5, 0.95, 1, "O", 2, False, False, False),
+            (2, 10.5, 0.95, 1, "P", 2, False, False, False),
+            (2, 11.5, 0.95, 1, "[", 2, False, False, False),
+            (2, 12.5, 0.95, 1, "]", 2, False, False, False),
+            (2, 13.5, 1.4, 1, "\\", 2, False, False, False),
             # Numpad Row 2
-            (2, 15.2, 0.95, "4", 3, False, False, False),
-            (2, 16.2, 0.95, "5", 3, False, False, False),
-            (2, 17.2, 0.95, "6", 3, False, False, False),
-            (2, 18.2, 0.95, "+", 3, False, False, False),
+            (2, 16.15, 0.95, 1, "7", 3, False, False, False),
+            (2, 17.15, 0.95, 1, "8", 3, False, False, False),
+            (2, 18.15, 0.95, 1, "9", 3, False, False, False),
+            (2, 19.15, 0.95, 2, "+", 3, False, False, False),
 
-            # Row 3: Home Row
-            (3, 0.0, 1.75, "CAPS", 0, False, False, False),
-            (3, 1.8, 0.95, "A", 0, True, False, False),
-            (3, 2.8, 0.95, "S", 0, True, False, False),
-            (3, 3.8, 0.95, "D", 0, True, False, False),
-            (3, 4.8, 0.95, "F", 0, False, False, False),
-            (3, 5.8, 0.95, "G", 1, False, False, False),
-            (3, 6.8, 0.95, "H", 1, False, False, False),
-            (3, 7.8, 0.95, "J", 1, False, False, False),
-            (3, 8.8, 0.95, "K", 1, False, False, False),
-            (3, 9.8, 0.95, "L", 2, False, False, False),
-            (3, 10.8, 0.95, ";", 2, False, False, False),
-            (3, 11.8, 0.95, "'", 2, False, False, False),
-            (3, 12.8, 2.1, "ENTER", 2, False, False, False),
+            # Row 3: Home Row & Numpad Row 3
+            (3, 0.0, 1.75, 1, "CAPS", 0, False, False, False),
+            (3, 1.8, 0.95, 1, "A", 0, True, False, False),
+            (3, 2.8, 0.95, 1, "S", 0, True, False, False),
+            (3, 3.8, 0.95, 1, "D", 0, True, False, False),
+            (3, 4.8, 0.95, 1, "F", 0, False, False, False),
+            (3, 5.8, 0.95, 1, "G", 1, False, False, False),
+            (3, 6.8, 0.95, 1, "H", 1, False, False, False),
+            (3, 7.8, 0.95, 1, "J", 1, False, False, False),
+            (3, 8.8, 0.95, 1, "K", 1, False, False, False),
+            (3, 9.8, 0.95, 1, "L", 2, False, False, False),
+            (3, 10.8, 0.95, 1, ";", 2, False, False, False),
+            (3, 11.8, 0.95, 1, "'", 2, False, False, False),
+            (3, 12.8, 2.1, 1, "ENTER", 2, False, False, False),
             # Numpad Row 3
-            (3, 15.2, 0.95, "1", 3, False, False, False),
-            (3, 16.2, 0.95, "2", 3, False, False, False),
-            (3, 17.2, 0.95, "3", 3, False, False, False),
-            (3, 18.2, 0.95, "+", 3, False, False, False),
+            (3, 16.15, 0.95, 1, "4", 3, False, False, False),
+            (3, 17.15, 0.95, 1, "5", 3, False, False, False),
+            (3, 18.15, 0.95, 1, "6", 3, False, False, False),
 
-            # Row 4: Shift Row
-            (4, 0.0, 2.25, "SHIFT", 0, False, False, False),
-            (4, 2.3, 0.95, "Z", 0, False, False, False),
-            (4, 3.3, 0.95, "X", 0, False, False, False),
-            (4, 4.3, 0.95, "C", 0, False, False, False),
-            (4, 5.3, 0.95, "V", 0, False, False, False),
-            (4, 6.3, 0.95, "B", 1, False, False, False),
-            (4, 7.3, 0.95, "N", 1, False, False, False),
-            (4, 8.3, 0.95, "M", 1, False, False, False),
-            (4, 9.3, 0.95, ",", 2, False, False, False),
-            (4, 10.3, 0.95, ".", 2, False, False, False),
-            (4, 11.3, 0.95, "/", 2, False, False, False),
-            (4, 12.3, 1.55, "SHIFT", 2, False, False, False),
-            (4, 13.95, 0.95, "▲", 2, False, True, False),
+            # Row 4: Shift Row & Numpad Row 4 (tall 'ENT' spans rows 4-5)
+            (4, 0.0, 2.25, 1, "SHIFT", 0, False, False, False),
+            (4, 2.3, 0.95, 1, "Z", 0, False, False, False),
+            (4, 3.3, 0.95, 1, "X", 0, False, False, False),
+            (4, 4.3, 0.95, 1, "C", 0, False, False, False),
+            (4, 5.3, 0.95, 1, "V", 0, False, False, False),
+            (4, 6.3, 0.95, 1, "B", 1, False, False, False),
+            (4, 7.3, 0.95, 1, "N", 1, False, False, False),
+            (4, 8.3, 0.95, 1, "M", 1, False, False, False),
+            (4, 9.3, 0.95, 1, ",", 2, False, False, False),
+            (4, 10.3, 0.95, 1, ".", 2, False, False, False),
+            (4, 11.3, 0.95, 1, "/", 2, False, False, False),
+            (4, 12.3, 1.55, 1, "SHIFT", 2, False, False, False),
+            (4, 13.95, 0.95, 1, "↑", 2, False, True, False),
             # Numpad Row 4
-            (4, 15.2, 1.95, "0", 3, False, False, False),
-            (4, 17.2, 0.95, ".", 3, False, False, False),
-            (4, 18.2, 0.95, "ENT", 3, False, False, False),
+            (4, 16.15, 0.95, 1, "1", 3, False, False, False),
+            (4, 17.15, 0.95, 1, "2", 3, False, False, False),
+            (4, 18.15, 0.95, 1, "3", 3, False, False, False),
+            (4, 19.15, 0.95, 2, "ENT", 3, False, False, False),
 
-            # Row 5: Bottom Row
-            (5, 0.0, 1.25, "CTRL", 0, False, False, False),
-            (5, 1.3, 0.95, "FN", 0, False, False, False),
-            (5, 2.3, 0.95, "WIN", 0, False, False, False),
-            (5, 3.3, 1.15, "ALT", 0, False, False, False),
-            (5, 4.5, 5.2, "SPACE", 1, False, False, False),
-            (5, 9.8, 1.15, "ALT", 2, False, False, False),
-            (5, 11.0, 1.15, "CTRL", 2, False, False, False),
-            (5, 12.95, 0.95, "◀", 2, False, True, False),
-            (5, 13.95, 0.95, "▼", 2, False, True, False),
-            (5, 14.95, 0.95, "►", 2, False, True, False),
+            # Row 5: Bottom Row & Numpad Row 5
+            (5, 0.0, 1.25, 1, "CTRL", 0, False, False, False),
+            (5, 1.3, 0.95, 1, "FN", 0, False, False, False),
+            (5, 2.3, 0.95, 1, "WIN", 0, False, False, False),
+            (5, 3.3, 1.15, 1, "ALT", 0, False, False, False),
+            (5, 4.5, 5.2, 1, "SPACE", 1, False, False, False),
+            (5, 9.8, 1.15, 1, "ALT", 2, False, False, False),
+            (5, 11.0, 1.15, 1, "CTRL", 2, False, False, False),
+            (5, 12.95, 0.95, 1, "←", 2, False, True, False),
+            (5, 13.95, 0.95, 1, "↓", 2, False, True, False),
+            (5, 14.95, 0.95, 1, "→", 2, False, True, False),
+            # Numpad Row 5
+            (5, 16.15, 1.95, 1, "0", 3, False, False, False),
+            (5, 18.15, 0.95, 1, ".", 3, False, False, False),
         ]
 
-        total_rel_w = 19.3
+        total_rel_w = 20.25
         unit_w = (well_w - 12) / total_rel_w
         row_h = (well_h - 10) / 6.0
 
-        for row, x_rel, w_rel, label, zone, is_wasd, is_arrow, is_pred in keys_def:
-            kx1 = pad_x + 6 + (x_rel * unit_w)
-            kx2 = kx1 + (w_rel * unit_w) - 2
-            ky1 = pad_y + 4 + (row * row_h)
-            ky2 = ky1 + row_h - 2
+        def _x_px(xr: float) -> float:
+            return pad_x + 6 + (xr * unit_w)
+
+        def _y_px(r: float) -> float:
+            return pad_y + 4 + (r * row_h)
+
+        # Underglow backdrops matched exactly to hardware zone topology
+        kb_type = self.laptop_info.keyboard_type
+        if kb_type == KeyboardType.ONE_ZONE_RGB:
+            zb = self._canvas_kb.create_rectangle(
+                pad_x + 1, pad_y + 1, pad_x + well_w - 1, pad_y + well_h - 1,
+                fill="#0D0D0D", outline="", width=0
+            )
+            self._kb_zone_backs.append(zb)
+        elif kb_type == KeyboardType.THREE_ZONE_RGB:
+            zone_w = (well_w - 2) / 3.0
+            for z in range(3):
+                zx1 = pad_x + 1 + (z * zone_w)
+                zx2 = zx1 + zone_w
+                zb = self._canvas_kb.create_rectangle(
+                    zx1, pad_y + 1, zx2, pad_y + well_h - 1,
+                    fill="#0D0D0D", outline="", width=0
+                )
+                self._kb_zone_backs.append(zb)
+        elif kb_type == KeyboardType.PER_KEY_RGB:
+            slices = 24
+            sw = (well_w - 2) / float(slices)
+            for s in range(slices):
+                sx1 = pad_x + 1 + (s * sw)
+                sx2 = sx1 + sw + 0.5
+                zb = self._canvas_kb.create_rectangle(
+                    sx1, pad_y + 1, sx2, pad_y + well_h - 1,
+                    fill="#0D0D0D", outline="", width=0
+                )
+                self._kb_zone_backs.append(zb)
+        else:
+            # 4-Zone RGB: build exact per-row seam polygons aligned to keys in each zone
+            row_seams: Dict[int, List[float]] = {}
+            for r in range(6):
+                z_bounds: Dict[int, Tuple[float, float]] = {}
+                for row_i, xr, wr, _, _, z_i, _, _, _ in keys_def:
+                    if row_i == r:
+                        k_left = _x_px(xr)
+                        k_right = _x_px(xr + wr) - 2
+                        if z_i not in z_bounds:
+                            z_bounds[z_i] = (k_left, k_right)
+                        else:
+                            z_bounds[z_i] = (min(z_bounds[z_i][0], k_left), max(z_bounds[z_i][1], k_right))
+                s01 = (z_bounds[0][1] + z_bounds[1][0]) / 2.0
+                s12 = (z_bounds[1][1] + z_bounds[2][0]) / 2.0
+                s23 = (z_bounds[2][1] + z_bounds[3][0]) / 2.0
+                row_seams[r] = [pad_x + 1, s01, s12, s23, pad_x + well_w - 1]
+
+            for z in range(4):
+                pts: List[float] = []
+                # Left edge top-to-bottom
+                for r in range(6):
+                    y_top = (pad_y + 1) if r == 0 else _y_px(r) - 1
+                    y_bot = (pad_y + well_h - 1) if r == 5 else _y_px(r + 1) - 1
+                    pts.extend([row_seams[r][z], y_top, row_seams[r][z], y_bot])
+                # Right edge bottom-to-top
+                for r in range(5, -1, -1):
+                    y_top = (pad_y + 1) if r == 0 else _y_px(r) - 1
+                    y_bot = (pad_y + well_h - 1) if r == 5 else _y_px(r + 1) - 1
+                    pts.extend([row_seams[r][z + 1], y_bot, row_seams[r][z + 1], y_top])
+                zb = self._canvas_kb.create_polygon(pts, fill="#0D0D0D", outline="", width=0)
+                self._kb_zone_backs.append(zb)
+
+        min_center = min(xr + wr * 0.5 for _, xr, wr, *_ in keys_def)
+        max_center = max(xr + wr * 0.5 for _, xr, wr, *_ in keys_def)
+        center_span = max(0.001, max_center - min_center)
+
+        for row, x_rel, w_rel, row_span, label, zone, is_wasd, is_arrow, is_pred in keys_def:
+            kx1 = _x_px(x_rel)
+            kx2 = _x_px(x_rel + w_rel) - 2
+            ky1 = _y_px(row)
+            ky2 = _y_px(row + row_span) - 2
 
             if is_wasd:
                 # Distinctive frosted white gamer keycap
                 k = self._canvas_kb.create_rectangle(
                     kx1, ky1, kx2, ky2,
-                    fill="#1A1A1A", outline="#FFFFFF", width=1.5
+                    fill="#141414", outline="#FFFFFF", width=1.5
                 )
-                self._canvas_kb.create_text(
+                txt_id = self._canvas_kb.create_text(
                     (kx1 + kx2) / 2, (ky1 + ky2) / 2,
                     text=label, font=(self.FONT_FAMILY, 7, "bold"), fill=self.ACCENT_YELLOW
                 )
@@ -743,11 +904,11 @@ class PredatorMusicToolbar:
                 # Inverted-T Arrow keys with frosted gamer outline
                 k = self._canvas_kb.create_rectangle(
                     kx1, ky1, kx2, ky2,
-                    fill="#1A1A1A", outline="#FFFFFF", width=1.5
+                    fill="#141414", outline="#FFFFFF", width=1.5
                 )
-                self._canvas_kb.create_text(
+                txt_id = self._canvas_kb.create_text(
                     (kx1 + kx2) / 2, (ky1 + ky2) / 2,
-                    text=label, font=(self.FONT_FAMILY, 7, "bold"), fill=self.ACCENT_YELLOW
+                    text=label, font=(self.FONT_FAMILY, 8, "bold"), fill=self.ACCENT_YELLOW
                 )
                 self._kb_key_arrows.append(k)
             elif is_pred:
@@ -756,24 +917,28 @@ class PredatorMusicToolbar:
                     kx1, ky1, kx2, ky2,
                     fill="#161616", outline=self.ACCENT_YELLOW, width=1.2
                 )
-                self._canvas_kb.create_text(
+                txt_id = self._canvas_kb.create_text(
                     (kx1 + kx2) / 2, (ky1 + ky2) / 2,
                     text=label, font=(self.FONT_FAMILY, 6, "bold"), fill=self.ACCENT_YELLOW
                 )
+                self._kb_key_predator.append(k)
             else:
                 k = self._canvas_kb.create_rectangle(
                     kx1, ky1, kx2, ky2,
                     fill="#0F0F0F", outline=self.BORDER_HAIRLINE, width=1
                 )
                 font_sz = 6 if len(label) > 3 else 7
-                self._canvas_kb.create_text(
+                txt_id = self._canvas_kb.create_text(
                     (kx1 + kx2) / 2, (ky1 + ky2) / 2,
                     text=label, font=(self.FONT_FAMILY, font_sz), fill=self.TEXT_SECONDARY
                 )
 
             self._kb_key_rects.append(k)
+            self._kb_key_texts.append(txt_id)
+            self._kb_key_labels.append(label)
             self._kb_key_zones.append(zone)
             self._kb_key_x_rels.append(x_rel)
+            self._kb_key_norm_x.append(((x_rel + w_rel * 0.5) - min_center) / center_span)
 
         # Reset rendered cache so next tick immediately paints keys with current colors
         self._last_rendered_colors = [(-1, -1, -1), (-1, -1, -1), (-1, -1, -1), (-1, -1, -1)]
@@ -1817,38 +1982,6 @@ class PredatorMusicToolbar:
         if self.on_toggle_battery_saver:
             self.on_toggle_battery_saver(new_val)
 
-    def _toggle_aux_sync_gui(self):
-        new_val = not getattr(self, "_aux_sync_enabled", True)
-        self._aux_sync_enabled = new_val
-        btn_bg = self.ACCENT_YELLOW if new_val else "#161616"
-        btn_fg = "#000000" if new_val else self.TEXT_MUTED
-
-        if hasattr(self, "_btn_aux_toggle") and self._btn_aux_toggle and self.root and self.root.winfo_exists():
-            try:
-                self._btn_aux_toggle.config(
-                    text="AUX SYNC: ON" if new_val else "AUX SYNC: OFF",
-                    bg=btn_bg, fg=btn_fg,
-                    highlightbackground=self.ACCENT_YELLOW if new_val else self.BORDER_HAIRLINE
-                )
-            except Exception:
-                pass
-
-        if hasattr(self, "_btn_tab3_aux_toggle") and self._btn_tab3_aux_toggle and self.root and self.root.winfo_exists():
-            try:
-                self._btn_tab3_aux_toggle.config(
-                    text="ENABLED" if new_val else "DISABLED",
-                    bg=btn_bg, fg=btn_fg,
-                    highlightbackground=self.ACCENT_YELLOW if new_val else self.BORDER_HAIRLINE
-                )
-            except Exception:
-                pass
-
-        if hasattr(self, "on_toggle_aux_sync") and self.on_toggle_aux_sync:
-            try:
-                self.on_toggle_aux_sync(new_val)
-            except Exception:
-                pass
-
     def _handle_plugged_effect_select(self, event=None):
         if self._combo_plugged_effect:
             mode = self._combo_plugged_effect.get()
@@ -1909,12 +2042,13 @@ class PredatorMusicToolbar:
 
     def set_aux_sync_state(self, enabled: bool):
         self._aux_sync_enabled = enabled
+        has_aux = bool(self.laptop_info.has_rear_lightbar or self.laptop_info.has_lid_logo)
         if self._btn_aux_toggle and self.root and self.root.winfo_exists():
             self._btn_aux_toggle.config(
-                text="AUX SYNC: ON" if enabled else "AUX SYNC: OFF",
-                bg=self.ACCENT_YELLOW if enabled else "#161616",
-                fg="#000000" if enabled else self.TEXT_MUTED,
-                highlightbackground=self.ACCENT_YELLOW if enabled else self.BORDER_HAIRLINE
+                text=("AUX SYNC: ON" if enabled else "AUX SYNC: OFF") if has_aux else "AUX: N/A",
+                bg=self.ACCENT_YELLOW if (enabled and has_aux) else "#161616",
+                fg="#000000" if (enabled and has_aux) else self.TEXT_MUTED,
+                highlightbackground=self.ACCENT_YELLOW if (enabled and has_aux) else self.BORDER_HAIRLINE
             )
         if self._btn_aux_tab3_toggle and self.root and self.root.winfo_exists():
             self._btn_aux_tab3_toggle.config(
@@ -1923,9 +2057,11 @@ class PredatorMusicToolbar:
                 fg="#000000" if enabled else self.TEXT_MUTED,
                 highlightbackground=self.ACCENT_YELLOW if enabled else self.BORDER_HAIRLINE
             )
-        if not enabled and self._canvas_lightbar and self._lightbar_rect:
+        self._last_rendered_colors = [(-1, -1, -1), (-1, -1, -1), (-1, -1, -1), (-1, -1, -1)]
+        if not enabled and self._canvas_lightbar:
             try:
-                self._canvas_lightbar.itemconfig(self._lightbar_rect, fill="#141414")
+                for seg in (self._lightbar_segs or ([self._lightbar_rect] if self._lightbar_rect else [])):
+                    self._canvas_lightbar.itemconfig(seg, fill="#101010")
             except Exception:
                 pass
 
@@ -1937,10 +2073,19 @@ class PredatorMusicToolbar:
                 if self._lbl_model:
                     self._lbl_model.config(text=f"// {laptop_info.display_name.upper()}")
                 if self._lbl_kb_matrix:
-                    self._lbl_kb_matrix.config(text=f"{laptop_info.model_name.upper()} MATRIX • {laptop_info.keyboard_type.value.upper()} • 80+ KEYS")
+                    self._lbl_kb_matrix.config(text=f"{laptop_info.model_name.upper()} MATRIX • {laptop_info.keyboard_type.value.upper()} • 100 KEYS")
                 if self._lbl_aux_badge:
-                    aux_text = "REAR LIGHTBAR & LOGO //" if laptop_info.has_rear_lightbar else "AUX PERIPHERALS //"
+                    if laptop_info.has_rear_lightbar:
+                        aux_text = "REAR LIGHTBAR & LOGO //"
+                    elif laptop_info.has_lid_logo:
+                        aux_text = "PREDATOR LID LOGO //"
+                    else:
+                        aux_text = "AUX PERIPHERALS // NONE ON MODEL"
                     self._lbl_aux_badge.config(text=aux_text)
+                if getattr(self, "_lbl_status_hw", None):
+                    self._lbl_status_hw.config(text=f"HARDWARE: {laptop_info.model_name.upper()} ({laptop_info.keyboard_type.value.upper()})")
+                self.set_aux_sync_state(self._aux_sync_enabled)
+                self._redraw_lightbar_canvas()
                 self._draw_full_keyboard()
             except Exception:
                 pass
@@ -2025,10 +2170,11 @@ class PredatorMusicToolbar:
         left = tk.Frame(bar, bg=self.SURFACE_PANEL)
         left.pack(side="left", padx=14, fill="y")
 
-        tk.Label(
-            left, text="HARDWARE: ACER PREDATOR HELIOS NEO 16 (PHN16-71)",
+        self._lbl_status_hw = tk.Label(
+            left, text=f"HARDWARE: {self.laptop_info.model_name.upper()} ({self.laptop_info.keyboard_type.value.upper()})",
             font=(self.FONT_FAMILY, 6, "bold"), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL
-        ).pack(side="left")
+        )
+        self._lbl_status_hw.pack(side="left")
 
         tk.Label(
             left, text="• WASAPI LOOPBACK (48 kHz) • 60 FPS NON-BLOCKING",
@@ -2200,10 +2346,10 @@ class PredatorMusicToolbar:
             try:
                 self._render_gui_frame()
                 self._power_poll_tick += 1
-                if self._power_poll_tick >= 45:
+                if self._power_poll_tick >= 90:
                     self._power_poll_tick = 0
                     self._poll_system_power()
-                self._after_id = self.root.after(33, self._schedule_gui_update)
+                self._after_id = self.root.after(16, self._schedule_gui_update)
             except Exception:
                 pass
         else:
@@ -2308,13 +2454,20 @@ class PredatorMusicToolbar:
 
         # 2. Update Full Realistic Keyboard Graphic & Live Keycap Illumination
         if colors and len(colors) == 4 and self._canvas_kb:
-            # Check if colors actually changed before costly Tkinter itemconfig calls
-            colors_changed = any(c != l for c, l in zip(colors, self._last_rendered_colors))
+            # Apply real hardware brightness & lighting-active scaling so projection matches physical output
+            bright_scale = (self._current_brightness / 100.0) if self._is_lighting_active else 0.0
+            effective_colors = [_scale_rgb_brightness(c, bright_scale) for c in colors]
+
+            # Check if effective colors actually changed before costly Tkinter itemconfig calls
+            colors_changed = any(c != l for c, l in zip(effective_colors, self._last_rendered_colors))
             if colors_changed:
-                self._last_rendered_colors = list(colors)
+                self._last_rendered_colors = list(effective_colors)
+                kb_type = self.laptop_info.keyboard_type
+                is_static = self._current_mode in ("Static Album Art", "Static Album Dominant")
+                is_beat_now = bool(state and getattr(state, "is_beat", False) and not is_static and bright_scale > 0.0)
 
                 for z in range(4):
-                    r, g, b = colors[z]
+                    r, g, b = effective_colors[z]
                     hex_c = f"#{r:02x}{g:02x}{b:02x}"
 
                     if z < len(self._kb_hex_labels):
@@ -2325,76 +2478,95 @@ class PredatorMusicToolbar:
                         dot_c, dot_id = self._kb_dots[z]
                         dot_c.itemconfig(dot_id, fill=hex_c)
 
-                    # Soft underglow backdrop per zone
-                    if z < len(self._kb_zone_backs):
-                        dim_hex = _dim_color(colors[z], 0.16)
-                        self._canvas_kb.itemconfig(self._kb_zone_backs[z], fill=dim_hex)
+                # Soft underglow backdrop matched to hardware zone topology
+                if kb_type == KeyboardType.ONE_ZONE_RGB:
+                    unified = map_4zone_to_n(effective_colors, 1)[0]
+                    if self._kb_zone_backs:
+                        self._canvas_kb.itemconfig(self._kb_zone_backs[0], fill=_blend_over_base((8, 8, 8), unified, 0.18))
+                elif kb_type == KeyboardType.THREE_ZONE_RGB:
+                    mapped_3 = map_4zone_to_n(effective_colors, 3)
+                    for z in range(min(3, len(self._kb_zone_backs))):
+                        self._canvas_kb.itemconfig(self._kb_zone_backs[z], fill=_blend_over_base((8, 8, 8), mapped_3[z], 0.18))
+                elif kb_type == KeyboardType.PER_KEY_RGB:
+                    n_backs = len(self._kb_zone_backs)
+                    if n_backs > 0:
+                        denom = float(max(1, n_backs - 1))
+                        for s_idx, zb in enumerate(self._kb_zone_backs):
+                            c_slice = self._smoothstep_per_key_color(effective_colors, s_idx / denom)
+                            self._canvas_kb.itemconfig(zb, fill=_blend_over_base((8, 8, 8), c_slice, 0.18))
+                else:
+                    for z in range(min(4, len(self._kb_zone_backs))):
+                        self._canvas_kb.itemconfig(self._kb_zone_backs[z], fill=_blend_over_base((8, 8, 8), effective_colors[z], 0.18))
 
                 # Recolor individual keycaps (adaptive Per-Key, 4-Zone, 3-Zone, or 1-Zone)
-                is_silent = all(sum(c) < 15 for c in colors)
-                is_per_key = self.laptop_info.is_per_key
-                total_w = 19.3
+                mapped_3_keys = map_4zone_to_n(effective_colors, 3) if kb_type == KeyboardType.THREE_ZONE_RGB else None
+                unified_1_key = map_4zone_to_n(effective_colors, 1)[0] if kb_type == KeyboardType.ONE_ZONE_RGB else None
+                wasd_set = set(self._kb_key_wasd)
+                arr_set = set(self._kb_key_arrows)
+                pred_set = set(self._kb_key_predator)
 
                 for idx in range(len(self._kb_key_rects)):
                     k_rect = self._kb_key_rects[idx]
                     z = self._kb_key_zones[idx]
-                    is_wasd = k_rect in self._kb_key_wasd
-                    is_arr = k_rect in self._kb_key_arrows
+                    is_wasd = k_rect in wasd_set
+                    is_arr = k_rect in arr_set
+                    is_pred = k_rect in pred_set
+                    norm_x = self._kb_key_norm_x[idx] if idx < len(self._kb_key_norm_x) else 0.5
 
-                    # Determine target keycap color
-                    if is_per_key and idx < len(self._kb_key_x_rels):
-                        x_rel = self._kb_key_x_rels[idx]
-                        norm_x = max(0.0, min(1.0, x_rel / total_w))
-                        if norm_x < 0.333:
-                            t = norm_x / 0.333
-                            c1, c2 = colors[0], colors[1]
-                        elif norm_x < 0.666:
-                            t = (norm_x - 0.333) / 0.333
-                            c1, c2 = colors[1], colors[2]
-                        else:
-                            t = (norm_x - 0.666) / 0.334
-                            c1, c2 = colors[2], colors[3]
-                        key_c = (
-                            int(c1[0] + (c2[0] - c1[0]) * t),
-                            int(c1[1] + (c2[1] - c1[1]) * t),
-                            int(c1[2] + (c2[2] - c1[2]) * t),
-                        )
-                    elif self.laptop_info.keyboard_type == KeyboardType.THREE_ZONE_RGB and idx < len(self._kb_key_x_rels):
-                        x_rel = self._kb_key_x_rels[idx]
-                        norm_x = max(0.0, min(1.0, x_rel / total_w))
-                        z3 = 0 if norm_x < 0.33 else (1 if norm_x < 0.66 else 2)
-                        key_c = colors[z3] if z3 < len(colors) else colors[-1]
-                    elif self.laptop_info.keyboard_type == KeyboardType.ONE_ZONE_RGB:
-                        key_c = colors[1]
+                    # Determine target keycap color matching real hardware driver mapping
+                    if kb_type == KeyboardType.PER_KEY_RGB:
+                        key_c = self._smoothstep_per_key_color(effective_colors, norm_x)
+                    elif mapped_3_keys is not None:
+                        z3 = 0 if norm_x < (1.0 / 3.0) else (1 if norm_x < (2.0 / 3.0) else 2)
+                        key_c = mapped_3_keys[z3]
+                    elif unified_1_key is not None:
+                        key_c = unified_1_key
                     else:
-                        key_c = colors[z]
+                        key_c = effective_colors[z]
 
-                    if is_silent:
-                        k_fill = "#141414" if (is_wasd or is_arr) else "#0F0F0F"
-                        k_out = "#FFFFFF" if (is_wasd or is_arr) else self.BORDER_HAIRLINE
+                    base_rgb = (20, 20, 20) if (is_wasd or is_arr) else (15, 15, 15)
+                    factor = 0.60 if (is_wasd or is_arr) else 0.32
+                    k_fill = _blend_over_base(base_rgb, key_c, factor)
+
+                    if is_wasd or is_arr:
+                        k_out = "#FFFFFF"
+                    elif sum(key_c) > 20:
+                        k_out = f"#{key_c[0]:02x}{key_c[1]:02x}{key_c[2]:02x}"
+                    elif is_pred:
+                        k_out = self.ACCENT_YELLOW
                     else:
-                        factor = 0.65 if (is_wasd or is_arr) else 0.30
-                        k_fill = _dim_color(key_c, factor)
-                        k_out = "#FFFFFF" if (is_wasd or is_arr) else (
-                            f"#{key_c[0]:02x}{key_c[1]:02x}{key_c[2]:02x}" if sum(key_c) > 25 else self.BORDER_HAIRLINE
-                        )
+                        k_out = self.BORDER_HAIRLINE
+
                     self._canvas_kb.itemconfig(k_rect, fill=k_fill, outline=k_out)
 
-                # Recolor Auxiliary Device lightbar strip
-                if self._canvas_lightbar and self._lightbar_rect:
-                    if self._aux_sync_enabled and not is_silent:
-                        if self._aux_mode == "Sub-Bass Strobe (Zone 1)":
-                            aux_color = colors[0]
-                        elif self._aux_mode == "Beat Pulse (Zone 2)":
-                            aux_color = colors[1]
-                        elif self._aux_mode == "Album Artwork Accent":
-                            aux_color = colors[2]
+                    if idx < len(self._kb_key_texts):
+                        t_id = self._kb_key_texts[idx]
+                        if is_wasd or is_arr:
+                            t_fill = self.ACCENT_YELLOW
+                        elif sum(key_c) > 45:
+                            # Subtle translucent backlit keycap legend tint
+                            t_fill = _blend_over_base((165, 165, 165), key_c, 0.35)
+                        elif is_pred:
+                            t_fill = self.ACCENT_YELLOW
                         else:
-                            aux_color = colors[1] if sum(colors[1]) > sum(colors[0]) else colors[0]
-                        aux_hex = _dim_color(aux_color, 0.85)
-                        self._canvas_lightbar.itemconfig(self._lightbar_rect, fill=aux_hex)
+                            t_fill = self.TEXT_SECONDARY
+                        self._canvas_kb.itemconfig(t_id, fill=t_fill)
+
+                # Recolor Auxiliary Device lightbar strip matching map_auxiliary_device_colors
+                if self._canvas_lightbar and self._lightbar_segs:
+                    has_aux = bool(self.laptop_info.has_rear_lightbar or self.laptop_info.has_lid_logo)
+                    if has_aux and self._aux_sync_enabled and any(sum(c) > 0 for c in effective_colors):
+                        aux_leds = map_auxiliary_device_colors(
+                            effective_colors,
+                            len(self._lightbar_segs),
+                            is_beat=is_beat_now
+                        )
+                        for s_idx, seg_id in enumerate(self._lightbar_segs):
+                            c_aux = aux_leds[s_idx] if s_idx < len(aux_leds) else effective_colors[1]
+                            self._canvas_lightbar.itemconfig(seg_id, fill=_dim_color(c_aux, 0.90))
                     else:
-                        self._canvas_lightbar.itemconfig(self._lightbar_rect, fill="#141414")
+                        for seg_id in self._lightbar_segs:
+                            self._canvas_lightbar.itemconfig(seg_id, fill="#101010")
 
         # 3. Update Audio Beat State, Spectrum Equalizer & Master VU Meter
         if state:
