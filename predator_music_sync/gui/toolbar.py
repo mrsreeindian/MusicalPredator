@@ -120,6 +120,9 @@ class PredatorMusicToolbar:
         on_toggle_aux_sync: Optional[Callable[[bool], None]] = None,
         on_aux_mode_change: Optional[Callable[[str], None]] = None,
         on_start_hardware_service: Optional[Callable[[], None]] = None,
+        on_toggle_physical_brightness: Optional[Callable[[bool], None]] = None,
+        physical_brightness_supported: bool = True,
+        initial_physical_brightness_enabled: bool = True,
         initial_aux_sync_enabled: bool = True,
         initial_aux_mode: str = "Beat Pulse (Zone 2)",
         controller_name: str = "Helios Neo 16 (4-Zone)",
@@ -162,6 +165,10 @@ class PredatorMusicToolbar:
         self.on_toggle_aux_sync = on_toggle_aux_sync
         self.on_aux_mode_change = on_aux_mode_change
         self.on_start_hardware_service = on_start_hardware_service
+        self.on_toggle_physical_brightness = on_toggle_physical_brightness
+        self._physical_brightness_supported = bool(physical_brightness_supported)
+        self._physical_brightness_enabled = bool(initial_physical_brightness_enabled)
+        self._suppress_bright_target: Optional[int] = None
 
         self.controller_name = controller_name
         self.is_hardware_connected = is_hardware_connected
@@ -259,6 +266,7 @@ class PredatorMusicToolbar:
         self._combo_theme: Optional[ttk.Combobox] = None
         self._slider_bright: Optional[tk.Scale] = None
         self._lbl_val_bright: Optional[tk.Label] = None
+        self._btn_phys_bright: Optional[tk.Button] = None
         self._slider_spd: Optional[tk.Scale] = None
         self._lbl_val_spd: Optional[tk.Label] = None
         self._slider_flash: Optional[tk.Scale] = None
@@ -1071,6 +1079,18 @@ class PredatorMusicToolbar:
         tk.Label(h1, text="HARDWARE BRIGHTNESS", font=(self.FONT_FAMILY, 7, "bold"), fg=self.TEXT_WHITE, bg=self.SURFACE_PANEL).pack(side="left")
         self._lbl_val_bright = tk.Label(h1, text=f"{self._current_brightness}%", font=(self.FONT_MONO, 7, "bold"), fg=self.ACCENT_YELLOW, bg=self.SURFACE_PANEL)
         self._lbl_val_bright.pack(side="right")
+        phys_active = self._physical_brightness_supported and self._physical_brightness_enabled
+        phys_text = "EC SYNC: ON" if phys_active else ("EC SYNC: OFF" if self._physical_brightness_supported else "SW SCALE")
+        self._btn_phys_bright = tk.Button(
+            h1, text=phys_text, font=(self.FONT_FAMILY, 6, "bold"),
+            bg="#1E1800" if phys_active else "#161616",
+            fg=self.ACCENT_YELLOW if phys_active else self.TEXT_MUTED,
+            bd=0, padx=6, pady=0, cursor="hand2" if self._physical_brightness_supported else "",
+            highlightthickness=1,
+            highlightbackground=self.ACCENT_YELLOW if phys_active else self.BORDER_HAIRLINE,
+            command=self._toggle_physical_brightness_gui
+        )
+        self._btn_phys_bright.pack(side="right", padx=(0, 8))
         self._slider_bright = tk.Scale(
             s1, from_=0, to=100, resolution=5, orient="horizontal",
             bg=self.SURFACE_PANEL, fg=self.TEXT_WHITE, highlightthickness=0, bd=0,
@@ -1080,7 +1100,7 @@ class PredatorMusicToolbar:
         )
         self._slider_bright.set(self._current_brightness)
         self._slider_bright.pack(fill="x")
-        tk.Label(s1, text="Overall physical LED power output (0% off, 100% full)", font=(self.FONT_FAMILY, 6), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL).pack(anchor="w")
+        tk.Label(s1, text="Physical EC backlight + Fn+F9/F10 hotkey sync (0% off, 100% full)", font=(self.FONT_FAMILY, 6), fg=self.TEXT_MUTED, bg=self.SURFACE_PANEL).pack(anchor="w")
 
         # 2. Animation Speed
         s2 = tk.Frame(form, bg=self.SURFACE_PANEL)
@@ -2226,12 +2246,66 @@ class PredatorMusicToolbar:
             self._handle_theme_change_direct(self._combo_theme.get())
 
     def _handle_bright_change(self, val):
-        b = int(float(val))
+        b = max(0, min(100, int(float(val))))
         self._current_brightness = b
         if self._lbl_val_bright:
             self._lbl_val_bright.config(text=f"{b}%")
+        self._last_rendered_colors = [(-1, -1, -1), (-1, -1, -1), (-1, -1, -1), (-1, -1, -1)]
+        if self._suppress_bright_target is not None and b == self._suppress_bright_target:
+            self._suppress_bright_target = None
+            return
+        self._suppress_bright_target = None
         if self.on_brightness_change:
             self.on_brightness_change(b)
+
+    def _clear_bright_suppress(self, expected: int):
+        if self._suppress_bright_target == expected:
+            self._suppress_bright_target = None
+
+    def set_brightness(self, value: int, notify: bool = False, source: str = "software"):
+        """Synchronizes brightness slider, label, and keyboard projection without feedback loops."""
+        b = max(0, min(100, int(value)))
+        self._current_brightness = b
+        if self._lbl_val_bright and self.root and self.root.winfo_exists():
+            try:
+                self._lbl_val_bright.config(text=f"{b}%")
+            except Exception:
+                pass
+        if self._slider_bright and self.root and self.root.winfo_exists():
+            try:
+                cur_slider = int(float(self._slider_bright.get()))
+                if cur_slider != b:
+                    self._suppress_bright_target = b
+                    self._slider_bright.set(b)
+                    self.root.after_idle(lambda t=b: self._clear_bright_suppress(t))
+            except Exception:
+                pass
+        self._last_rendered_colors = [(-1, -1, -1), (-1, -1, -1), (-1, -1, -1), (-1, -1, -1)]
+        if notify and self.on_brightness_change:
+            self.on_brightness_change(b)
+
+    def _toggle_physical_brightness_gui(self):
+        if not self._physical_brightness_supported:
+            return
+        new_val = not self._physical_brightness_enabled
+        self.set_physical_brightness_enabled(new_val)
+        if self.on_toggle_physical_brightness:
+            self.on_toggle_physical_brightness(new_val)
+
+    def set_physical_brightness_enabled(self, enabled: bool):
+        self._physical_brightness_enabled = bool(enabled)
+        if self._btn_phys_bright and self.root and self.root.winfo_exists():
+            phys_active = self._physical_brightness_supported and self._physical_brightness_enabled
+            phys_text = "EC SYNC: ON" if phys_active else ("EC SYNC: OFF" if self._physical_brightness_supported else "SW SCALE")
+            try:
+                self._btn_phys_bright.config(
+                    text=phys_text,
+                    bg="#1E1800" if phys_active else "#161616",
+                    fg=self.ACCENT_YELLOW if phys_active else self.TEXT_MUTED,
+                    highlightbackground=self.ACCENT_YELLOW if phys_active else self.BORDER_HAIRLINE,
+                )
+            except Exception:
+                pass
 
     def _handle_sens_change(self, val):
         s = float(val)

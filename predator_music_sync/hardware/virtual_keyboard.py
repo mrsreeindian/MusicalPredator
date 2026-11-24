@@ -41,6 +41,7 @@ class VirtualKeyboardBackend(KeyboardControllerBase):
         self._unscaled_colors: List[Tuple[int, int, int]] = [(0, 0, 0)] * self.NUM_ZONES
         self._last_is_beat: bool = False
         self._device_led_colors: Dict[int, List[Tuple[int, int, int]]] = {}
+        self._hw_brightness_level = self._brightness
         self.refresh_devices()
 
     def refresh_devices(self):
@@ -82,9 +83,37 @@ class VirtualKeyboardBackend(KeyboardControllerBase):
         val = max(0, min(100, int(value)))
         if val != self._brightness:
             self._brightness = val
+            if self._physical_brightness_enabled:
+                self._hw_brightness_level = val
             self._recompute_scaled_outputs()
             if self._on_update:
                 self._on_update(list(self._current_colors))
+
+    @property
+    def supports_hardware_brightness(self) -> bool:
+        return True
+
+    def get_hardware_brightness(self) -> Optional[int]:
+        return int(self._hw_brightness_level if self._hw_brightness_level is not None else self._brightness)
+
+    def set_hardware_brightness(self, level: int) -> bool:
+        val = max(0, min(100, int(level)))
+        self._hw_brightness_level = val
+        self.brightness = val
+        return True
+
+    def simulate_physical_brightness_key(self, delta: int) -> int:
+        """Simulates physical Fn+F9/F10 EC brightness adjustment and notifies listeners."""
+        cur = self._hw_brightness_level if self._hw_brightness_level is not None else self._brightness
+        new_val = max(0, min(100, int(cur) + int(delta)))
+        self._hw_brightness_level = new_val
+        if new_val != self._brightness:
+            self._brightness = new_val
+            self._recompute_scaled_outputs()
+            if self._on_update:
+                self._on_update(list(self._current_colors))
+        self._notify_brightness_listeners(new_val, source="hardware")
+        return new_val
 
     def _recompute_scaled_outputs(self):
         """Recomputes scaled 4-zone colors and expanded per-device LED arrays."""

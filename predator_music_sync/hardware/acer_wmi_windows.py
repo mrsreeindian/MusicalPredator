@@ -29,6 +29,7 @@ class WindowsAcerWmiBackend(KeyboardControllerBase):
     def __init__(self):
         super().__init__()
         self._wmi_available = False
+        self._unscaled_colors: List[Tuple[int, int, int]] = [(0, 0, 0)] * self.NUM_ZONES
         self._creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) if sys.platform == "win32" else 0
         self._startupinfo = None
         if sys.platform == "win32":
@@ -36,6 +37,65 @@ class WindowsAcerWmiBackend(KeyboardControllerBase):
             self._startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             self._startupinfo.wShowWindow = subprocess.SW_HIDE
         self._init_wmi()
+        if self._wmi_available:
+            hw_b = self.get_hardware_brightness()
+            if hw_b is not None:
+                self._hw_brightness_level = hw_b
+                self._brightness = hw_b
+
+    @property
+    def supports_hardware_brightness(self) -> bool:
+        return self._wmi_available
+
+    def _effective_scale(self) -> float:
+        if self._brightness <= 0:
+            return 0.0
+        hw_b = getattr(self, "_hw_brightness_level", None)
+        if self.physical_brightness_enabled and hw_b is not None and hw_b > 0:
+            return min(1.0, self._brightness / float(hw_b))
+        return self._brightness / 100.0
+
+    def get_hardware_brightness(self) -> Optional[int]:
+        """Queries physical EC keyboard backlight brightness via AcerGamingFunction.GetGamingKBBacklight."""
+        if not self._wmi_available:
+            return None
+        ps_script = r"""
+        $obj = Get-CimInstance -Namespace 'root\WMI' -ClassName 'AcerGamingFunction' -ErrorAction Stop
+        $bytes = [byte[]](0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+        $res = Invoke-CimMethod -InputObject $obj -MethodName 'GetGamingKBBacklight' -Arguments @{ gmInput = $bytes }
+        if ($res.gmReturn -ne $null -and [int]$res.gmReturn -ne 0) { exit 1 }
+        $out = [byte[]]$res.gmOutput
+        if ($out.Length -ge 3) { Write-Output ([int]$out[2]); exit 0 }
+        exit 1
+        """
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                creationflags=self._creationflags,
+                startupinfo=self._startupinfo
+            )
+            if res.returncode == 0 and res.stdout.strip().isdigit():
+                val = max(0, min(100, int(res.stdout.strip())))
+                self._hw_brightness_level = val
+                return val
+        except Exception:
+            pass
+        return None
+
+    def set_hardware_brightness(self, level: int) -> bool:
+        """Sets physical EC keyboard backlight brightness via SetGamingKBBacklight."""
+        val = max(0, min(100, int(level)))
+        self._brightness = val
+        if not self._wmi_available:
+            return False
+        primary = self._unscaled_colors[1] if len(self._unscaled_colors) > 1 else (255, 255, 255)
+        ok = self.set_hardware_mode(0, 5, val, 1, primary[0], primary[1], primary[2])
+        if ok:
+            self._hw_brightness_level = val
+        return ok
 
     def _init_wmi(self):
         r"""Test if root\WMI AcerGamingFunction is accessible."""
@@ -84,6 +144,18 @@ class WindowsAcerWmiBackend(KeyboardControllerBase):
         except Exception:
             return False
 
+    @property
+    def brightness(self) -> int:
+        return self._brightness
+
+    @brightness.setter
+    def brightness(self, value: int):
+        val = max(0, min(100, int(value)))
+        if val != self._brightness:
+            self._brightness = val
+            if self._wmi_available and self.physical_brightness_enabled:
+                self.set_hardware_brightness(val)
+
     def set_zone_color(self, zone: int, r: int, g: int, b: int) -> bool:
         """
         Sets a specific zone's color using Acer's SetGamingLEDBehavior command.
@@ -92,10 +164,15 @@ class WindowsAcerWmiBackend(KeyboardControllerBase):
         if not (0 <= zone < self.NUM_ZONES):
             return False
 
-        scale = self._brightness / 100.0
-        r_sc = int(max(0, min(255, r)) * scale)
-        g_sc = int(max(0, min(255, g)) * scale)
-        b_sc = int(max(0, min(255, b)) * scale)
+        self._unscaled_colors[zone] = (
+            max(0, min(255, int(r))),
+            max(0, min(255, int(g))),
+            max(0, min(255, int(b))),
+        )
+        scale = self._effective_scale()
+        r_sc = int(self._unscaled_colors[zone][0] * scale)
+        g_sc = int(self._unscaled_colors[zone][1] * scale)
+        b_sc = int(self._unscaled_colors[zone][2] * scale)
         self._current_colors[zone] = (r_sc, g_sc, b_sc)
 
         mask = self.ZONE_MASKS[zone]
@@ -111,13 +188,18 @@ class WindowsAcerWmiBackend(KeyboardControllerBase):
         if len(colors) < self.NUM_ZONES:
             return False
 
-        scale = self._brightness / 100.0
+        scale = self._effective_scale()
         for i in range(self.NUM_ZONES):
             r, g, b = colors[i]
+            self._unscaled_colors[i] = (
+                max(0, min(255, int(r))),
+                max(0, min(255, int(g))),
+                max(0, min(255, int(b))),
+            )
             self._current_colors[i] = (
-                int(max(0, min(255, r)) * scale),
-                int(max(0, min(255, g)) * scale),
-                int(max(0, min(255, b)) * scale)
+                int(self._unscaled_colors[i][0] * scale),
+                int(self._unscaled_colors[i][1] * scale),
+                int(self._unscaled_colors[i][2] * scale)
             )
 
         # First activate mode 7

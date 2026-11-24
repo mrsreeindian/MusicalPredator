@@ -149,6 +149,10 @@ class PredatorSyncService:
 
         # Callbacks for UI updates
         self._state_listeners: List[Callable[[List[RGBColor], Optional[MediaTrackInfo], Optional[AudioBeatState]], None]] = []
+        self._brightness_listeners: List[Callable[[int, str], None]] = []
+
+        if hasattr(self.controller, "add_brightness_listener"):
+            self.controller.add_brightness_listener(self._on_controller_brightness_changed)
 
         # =====================================================================
         # POWER & BATTERY SUBSYSTEM (Dual Power Profiles & Battery Saver)
@@ -421,8 +425,51 @@ class PredatorSyncService:
                         elif self.current_palette is None:
                             self.current_palette = ColorPaletteExtractor.DEFAULT_PALETTES[0]
 
-    def set_brightness(self, val: int):
-        self.controller.brightness = int(val)
+    def get_brightness(self) -> int:
+        return int(self.controller.brightness)
+
+    def set_brightness(self, val: int, source: str = "software"):
+        clamped = max(0, min(100, int(val)))
+        self.controller.brightness = clamped
+        self._notify_brightness_listeners(clamped, source)
+
+    def step_brightness(self, delta: int, source: str = "software") -> int:
+        new_val = max(0, min(100, int(self.controller.brightness) + int(delta)))
+        self.set_brightness(new_val, source=source)
+        return new_val
+
+    def is_physical_brightness_supported(self) -> bool:
+        return bool(getattr(self.controller, "supports_hardware_brightness", False))
+
+    def is_physical_brightness_enabled(self) -> bool:
+        return bool(getattr(self.controller, "physical_brightness_enabled", True))
+
+    def set_physical_brightness_enabled(self, enabled: bool):
+        if hasattr(self.controller, "physical_brightness_enabled"):
+            self.controller.physical_brightness_enabled = bool(enabled)
+
+    def add_brightness_listener(self, listener: Callable[[int, str], None]):
+        with self._lock:
+            if listener not in self._brightness_listeners:
+                self._brightness_listeners.append(listener)
+
+    def remove_brightness_listener(self, listener: Callable[[int, str], None]):
+        with self._lock:
+            if listener in self._brightness_listeners:
+                self._brightness_listeners.remove(listener)
+
+    def _notify_brightness_listeners(self, level: int, source: str = "software"):
+        with self._lock:
+            listeners = list(self._brightness_listeners)
+        for listener in listeners:
+            try:
+                listener(int(level), source)
+            except Exception:
+                pass
+
+    def _on_controller_brightness_changed(self, level: int, source: str = "hardware"):
+        """Propagates physical EC brightness changes (e.g. Fn+F9 / Fn+F10) to service listeners."""
+        self._notify_brightness_listeners(int(level), source)
 
     def set_sensitivity(self, val: float):
         self.audio_engine.sensitivity = float(val)

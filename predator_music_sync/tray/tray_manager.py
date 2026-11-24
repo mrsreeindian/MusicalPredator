@@ -80,8 +80,10 @@ class PredatorTrayManager:
         on_set_mode: Callable[[str], None],
         on_exit_app: Callable[[], None],
         on_toggle_autostart: Optional[Callable[[bool], None]] = None,
+        on_set_brightness: Optional[Callable[[int], None]] = None,
         initial_lighting_active: bool = True,
         initial_mode: str = "Dynamic Studio EQ",
+        initial_brightness: int = 100,
         hardware_status_text: str = "Helios Neo 16 [Connected]"
     ):
         self.on_show_window = on_show_window
@@ -90,9 +92,11 @@ class PredatorTrayManager:
         self.on_set_mode = on_set_mode
         self.on_exit_app = on_exit_app
         self.on_toggle_autostart = on_toggle_autostart
+        self.on_set_brightness = on_set_brightness
 
         self._lighting_active = initial_lighting_active
         self._current_mode = initial_mode
+        self._current_brightness = max(0, min(100, int(initial_brightness)))
         self._hw_status_text = hardware_status_text
         self._power_status_text = "Plugged In"
         self._disable_on_battery_saver = True
@@ -119,6 +123,45 @@ class PredatorTrayManager:
                 "Start on Windows Boot",
                 self._handle_toggle_autostart,
                 checked=lambda item: is_autostart_enabled()
+            ),
+            item(
+                lambda it: f"Brightness ({self._current_brightness}%)",
+                Menu(
+                    item(
+                        "Increase (+25%)",
+                        lambda icon, it: self._handle_step_brightness(25)
+                    ),
+                    item(
+                        "Decrease (-25%)",
+                        lambda icon, it: self._handle_step_brightness(-25)
+                    ),
+                    Menu.SEPARATOR,
+                    item(
+                        "100% (Full)",
+                        lambda icon, it: self._handle_set_brightness(100),
+                        checked=lambda item: self._current_brightness >= 90
+                    ),
+                    item(
+                        "75%",
+                        lambda icon, it: self._handle_set_brightness(75),
+                        checked=lambda item: 65 <= self._current_brightness < 90
+                    ),
+                    item(
+                        "50%",
+                        lambda icon, it: self._handle_set_brightness(50),
+                        checked=lambda item: 40 <= self._current_brightness < 65
+                    ),
+                    item(
+                        "25%",
+                        lambda icon, it: self._handle_set_brightness(25),
+                        checked=lambda item: 1 <= self._current_brightness < 40
+                    ),
+                    item(
+                        "0% (Off)",
+                        lambda icon, it: self._handle_set_brightness(0),
+                        checked=lambda item: self._current_brightness == 0
+                    ),
+                )
             ),
             item(
                 "Quick Modes",
@@ -217,6 +260,13 @@ class PredatorTrayManager:
         if changed:
             self._safe_update_menu()
 
+    def update_brightness(self, level: int):
+        clamped = max(0, min(100, int(level)))
+        changed = (self._current_brightness != clamped)
+        self._current_brightness = clamped
+        if changed:
+            self._safe_update_menu()
+
     def update_autostart_state(self):
         self._safe_update_menu()
 
@@ -277,6 +327,16 @@ class PredatorTrayManager:
         if self.on_set_mode:
             self.on_set_mode(mode_name)
         self._safe_update_menu()
+
+    def _handle_set_brightness(self, level: int):
+        clamped = max(0, min(100, int(level)))
+        self._current_brightness = clamped
+        if self.on_set_brightness:
+            self.on_set_brightness(clamped)
+        self._safe_update_menu()
+
+    def _handle_step_brightness(self, delta: int):
+        self._handle_set_brightness(self._current_brightness + int(delta))
 
     def _handle_exit_app(self, icon, item):
         if self.on_exit_app:

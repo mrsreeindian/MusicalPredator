@@ -71,7 +71,7 @@ class PredatorMusicSyncApp:
         self.gui = PredatorMusicToolbar(
             on_mode_change=self.set_animation_mode,
             on_sensitivity_change=self.service.set_sensitivity,
-            on_brightness_change=self.service.set_brightness,
+            on_brightness_change=self.set_brightness,
             on_speed_change=self.service.set_speed,
             on_flash_change=self.service.set_flash,
             on_theme_change=self.service.set_theme,
@@ -89,6 +89,9 @@ class PredatorMusicSyncApp:
             on_plugged_effect_change=lambda mode: self.service.set_ac_profile(mode=mode),
             on_battery_effect_change=lambda mode: self.service.set_battery_profile(mode=mode),
             on_battery_brightness_cap_change=self.service.set_battery_brightness_cap,
+            on_toggle_physical_brightness=self.service.set_physical_brightness_enabled,
+            physical_brightness_supported=self.service.is_physical_brightness_supported(),
+            initial_physical_brightness_enabled=self.service.is_physical_brightness_enabled(),
             laptop_info=laptop_info,
             controller_name=self.service.controller_name,
             is_hardware_connected=self.service.is_hardware_connected,
@@ -97,7 +100,7 @@ class PredatorMusicSyncApp:
             selected_device_index=self.service.audio_engine.device_index,
             initial_mode=self.service.active_animation_name,
             initial_theme="Auto (Album Cover)",
-            initial_brightness=self.service.controller.brightness,
+            initial_brightness=self.service.get_brightness(),
             initial_sensitivity=self.service.audio_engine.sensitivity,
             initial_speed=self.service._current_speed,
             initial_flash=self.service._current_flash,
@@ -117,14 +120,17 @@ class PredatorMusicSyncApp:
             on_set_mode=self.set_animation_mode,
             on_exit_app=self.exit_completely,
             on_toggle_autostart=self.toggle_autostart,
+            on_set_brightness=self.set_brightness,
             initial_lighting_active=self.service._lighting_enabled,
             initial_mode=self.service.active_animation_name,
+            initial_brightness=self.service.get_brightness(),
             hardware_status_text=hw_status_str
         )
 
         # 4. Connect Service State Stream to GUI Visualizer
         self.service.add_state_listener(self._on_service_state_tick)
         self.service.add_power_listener(self._on_power_state_changed)
+        self.service.add_brightness_listener(self._on_brightness_changed)
 
         # Wire Power Management callbacks to GUI
         self.gui.on_toggle_battery_saver = self.service.set_battery_saver_disable
@@ -282,6 +288,11 @@ class PredatorMusicSyncApp:
         latest_track = getattr(self.service, "_latest_track", None)
         if latest_track:
             self.gui.update_track_info(latest_track)
+        if hasattr(self.gui, "set_brightness"):
+            try:
+                self.gui.set_brightness(self.service.get_brightness(), notify=False)
+            except Exception:
+                pass
 
     def restore_window(self):
         """Restores and brings the GUI window to the foreground."""
@@ -295,6 +306,16 @@ class PredatorMusicSyncApp:
         self.service.set_animation_mode(mode_name)
         self.tray.update_mode(mode_name)
         self._dispatch_to_gui(lambda m=mode_name: self.gui.set_mode(m, notify=False))
+
+    def set_brightness(self, level: int):
+        self.service.set_brightness(level, source="software")
+
+    def _on_brightness_changed(self, level: int, source: str = "software"):
+        """Synchronizes GUI slider and Tray brightness readout when brightness changes."""
+        if self.tray and hasattr(self.tray, "update_brightness"):
+            self.tray.update_brightness(level)
+        if self.gui and hasattr(self.gui, "set_brightness"):
+            self._dispatch_to_gui(lambda b=level, s=source: self.gui.set_brightness(b, notify=False, source=s))
 
     def toggle_lighting(self, enabled: bool):
         self.service.toggle_lighting(enabled)
@@ -380,6 +401,7 @@ class PredatorMusicSyncApp:
         try:
             self.service.remove_state_listener(self._on_service_state_tick)
             self.service.remove_power_listener(self._on_power_state_changed)
+            self.service.remove_brightness_listener(self._on_brightness_changed)
         except Exception:
             pass
         self.service.stop()
